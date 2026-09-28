@@ -230,6 +230,8 @@ For anything else, open your browser's developer console (F12). The card logs it
 - New events are always added to the one `primary` calendar.
 - Event notes are plain text.
 
+<a href="https://www.buymeacoffee.com/KragHorn" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
+
 ## License
 
 See [LICENSE](LICENSE).
