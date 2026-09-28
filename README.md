@@ -30,7 +30,7 @@ It's a single JavaScript file. No helpers, scripts, template sensors or `browser
 
 1. In Home Assistant, open **HACS**.
 2. Open the ⋮ menu (top right) and choose **Custom repositories**.
-3. Paste this repository's URL, `https://github.com/YOUR_GITHUB_USERNAME/interactive-calendar-card`, choose the **Dashboard** type (called **Lovelace** or **Plugin** in older HACS versions), and click **Add**.
+3. Paste this repository's URL, `https://github.com/KragHorn/interactive-calendar-card`, choose the **Dashboard** type (called **Lovelace** or **Plugin** in older HACS versions), and click **Add**.
 4. Find **Interactive Calendar Card** in HACS and click **Download**.
 5. Reload your browser when HACS asks you to.
 
