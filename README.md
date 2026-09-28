@@ -4,8 +4,7 @@ A month-view calendar card for [Home Assistant](https://www.home-assistant.io/) 
 
 It's a single JavaScript file. No helpers, scripts, template sensors or `browser_mod` needed.
 
-<!-- Add a screenshot: save it in the repo (e.g. images/screenshot.png) and uncomment the line below -->
-<!-- ![Interactive Calendar Card](images/screenshot.png) -->
+   ![Interactive Calendar Card](calendar.png)
 
 ## Features
 
