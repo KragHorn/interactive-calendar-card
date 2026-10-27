@@ -17,6 +17,15 @@ const FEATURE_UPDATE = 4;
 // Used when a calendar in the config has no color set
 const DEFAULT_PALETTE = ["#0a84ff", "#ff9f0a", "#ff375f", "#30d158", "#bf5af2", "#64d2ff", "#ffd60a"];
 
+// ---- On-screen keyboard layout ------------------------------------------------
+const KB_NUMBERS = "1234567890".split("");
+const KB_LETTERS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"].map((r) => r.split(""));
+const KB_SYMBOLS = [
+  "@#$%&*-+=/".split(""),
+  "()[]{}<>^~".split(""),
+  ["\\", "!", "?", ":", ";", "'", "\"", "_"],
+];
+
 // ---- Date helpers -----------------------------------------------------------
 const pad = (n) => String(n).padStart(2, "0");
 // Date -> "YYYY-MM-DD" (for <input type="date">)
@@ -46,6 +55,7 @@ class InteractiveCalendarCard extends LitElement {
       _hidden: {},
       _syncing: {},
       _dialog: {},
+      _kb: {},
     };
   }
 
@@ -60,6 +70,19 @@ class InteractiveCalendarCard extends LitElement {
     this._lastFetch = 0;
     this._lastSync = 0;
     this._fetchToken = 0;
+    this._kb = null;       // null (hidden) or { shift: "off" | "once" | "lock", symbols: bool }
+    this._kbEl = null;     // the input/textarea the keyboard is typing into
+    this._kbLastShift = 0;
+  }
+
+  // ---- Visual editor hooks ----------------------------------------------------
+  static getConfigElement() {
+    return document.createElement("interactive-calendar-card-editor");
+  }
+
+  static getStubConfig(hass) {
+    const cal = Object.keys((hass && hass.states) || {}).find((id) => id.startsWith("calendar."));
+    return { entities: [cal || "calendar.my_calendar"] };
   }
 
   /*
@@ -106,8 +129,13 @@ class InteractiveCalendarCard extends LitElement {
       throw new Error('default_start_time must look like "09:00"');
     }
 
+    // on_screen_keyboard: always (default) | touch (touchscreens only) | off
+    const kbRaw = config.on_screen_keyboard;
+    const keyboard = kbRaw === false || kbRaw === "off" ? "off" : kbRaw === "touch" ? "touch" : "always";
+
     this._opts = {
       title: config.title || "",
+      keyboard,
       firstDay: firstDay === "monday" ? 1 : 0,
       hour12: timeFormat === "12h",
       showLegend: config.show_legend ?? calendars.length > 1,
@@ -294,6 +322,7 @@ class InteractiveCalendarCard extends LitElement {
   }
 
   _startEdit() {
+    this._kbClose();
     const ev = this._dialog.ev;
     const desc = this._plainText(ev.description);
     // Google's all-day end date is the day *after* the last day; the form shows the last day
@@ -320,10 +349,12 @@ class InteractiveCalendarCard extends LitElement {
   }
 
   _backToView() {
+    this._kbClose();
     this._dialog = { ...this._dialog, mode: "view", form: null, error: "", confirmDelete: false };
   }
 
   _closeDialog() {
+    this._kbClose();
     this._dialog = null;
   }
 
@@ -516,16 +547,185 @@ class InteractiveCalendarCard extends LitElement {
     return luminance > 0.62 ? "#1c1c1e" : "#ffffff";
   }
 
+  // ---- On-screen keyboard -----------------------------------------------------
+  // It is rendered inside the <dialog>: a modal dialog makes everything outside
+  // it inert, so a keyboard living elsewhere on the page could not be tapped.
+
+  get _kbEnabled() {
+    const mode = this._opts.keyboard;
+    return (
+      mode === "always" ||
+      (mode === "touch" && !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches)
+    );
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    this._kbBsStop();
+  }
+
+  _kbClose() {
+    this._kbBsStop();
+    this._kb = null;
+    this._kbEl = null;
+  }
+
+  // Focus moving into a text field opens the keyboard. Date pickers and the
+  // checkbox close it. Buttons leave it alone so a tap on Save is never lost to
+  // a layout shift.
+  _onDialogFocusIn(e) {
+    if (!this._kbEnabled || !this._dialog || this._dialog.mode === "view") return;
+    const el = e.target;
+    if (!el || !el.matches) return;
+    if (el.closest(".kb")) return;
+    if (el.matches("[data-kb]")) {
+      const prev = this._kb || { symbols: false, shift: "off" };
+      this._kbEl = el;
+      this._kb = { ...prev, shift: prev.shift === "lock" ? "lock" : this._kbAutoShift(el) };
+      this.updateComplete.then(() => requestAnimationFrame(() => {
+        if (el.isConnected) el.scrollIntoView({ block: "nearest" });
+      }));
+    } else if (el.matches("input")) {
+      this._kbClose();
+    }
+  }
+
+  // Capitalise at the start of the field and after . ! ? or a new line
+  _kbAutoShift(el) {
+    const before = el.value.slice(0, el.selectionStart ?? el.value.length);
+    return before === "" || /[.!?]\s$/.test(before) || /\n$/.test(before) ? "once" : "off";
+  }
+
+  _kbAfterEdit(el) {
+    if (this._kb && this._kb.shift !== "lock") {
+      this._kb = { ...this._kb, shift: this._kbAutoShift(el) };
+    }
+  }
+
+  _kbType(text) {
+    const el = this._kbEl;
+    if (!el || !el.isConnected) return;
+    if (this.renderRoot.activeElement !== el) el.focus({ preventScroll: true });
+    const start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? start;
+    el.setRangeText(text, start, end, "end");
+    // Reuse the inputs' own @input handlers so the form state stays in sync
+    el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    this._kbAfterEdit(el);
+  }
+
+  _kbBackspace() {
+    const el = this._kbEl;
+    if (!el || !el.isConnected) return;
+    if (this.renderRoot.activeElement !== el) el.focus({ preventScroll: true });
+    let start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? start;
+    if (start === end) {
+      if (start === 0) return;
+      const code = el.value.charCodeAt(start - 1);
+      start -= code >= 0xdc00 && code <= 0xdfff && start > 1 ? 2 : 1; // emoji / surrogate pairs
+    }
+    el.setRangeText("", start, end, "end");
+    el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    this._kbAfterEdit(el);
+  }
+
+  // Hold backspace to keep deleting
+  _kbBsDown(e) {
+    e.preventDefault();
+    this._kbBsStop();
+    this._kbBackspace();
+    this._kbBsTimer = setTimeout(() => {
+      this._kbBsInt = setInterval(() => this._kbBackspace(), 55);
+    }, 380);
+  }
+
+  _kbBsStop() {
+    clearTimeout(this._kbBsTimer);
+    clearInterval(this._kbBsInt);
+  }
+
+  // One tap = capitalise the next letter, double tap = caps lock
+  _kbShift() {
+    const now = Date.now();
+    const dbl = now - this._kbLastShift < 350;
+    this._kbLastShift = now;
+    const cur = this._kb.shift;
+    const next = cur === "lock" ? "off" : dbl ? "lock" : cur === "off" ? "once" : "off";
+    this._kb = { ...this._kb, shift: next };
+  }
+
+  _kbEnter() {
+    const el = this._kbEl;
+    if (el && el.tagName === "TEXTAREA") {
+      this._kbType("\n");
+    } else {
+      if (el) el.blur();
+      this._kbClose();
+    }
+  }
+
+  _renderKeyboard() {
+    const kb = this._kb;
+    const upper = kb.shift !== "off";
+    const isArea = !!this._kbEl && this._kbEl.tagName === "TEXTAREA";
+    const letters = kb.symbols ? KB_SYMBOLS : KB_LETTERS;
+
+    const key = (label, onClick, cls = "") => html`
+      <button type="button" tabindex="-1" class="kb-key ${cls}" @click="${onClick}">${label}</button>`;
+    const ch = (c) => {
+      const out = upper ? c.toUpperCase() : c;
+      return key(out, () => this._kbType(out));
+    };
+
+    return html`
+      <div class="kb" @mousedown="${(e) => e.preventDefault()}">
+        <div class="kb-row">${KB_NUMBERS.map(ch)}</div>
+        <div class="kb-row">${letters[0].map(ch)}</div>
+        <div class="kb-row kb-inset">${letters[1].map(ch)}</div>
+        <div class="kb-row">
+          ${kb.symbols ? "" : key(kb.shift === "lock" ? "⇪" : "⇧", () => this._kbShift(), `kb-wide ${upper ? "kb-on" : ""}`)}
+          ${letters[2].map(ch)}
+          <button type="button" tabindex="-1" class="kb-key kb-wide" aria-label="Backspace"
+                  @pointerdown="${(e) => this._kbBsDown(e)}"
+                  @pointerup="${() => this._kbBsStop()}"
+                  @pointerleave="${() => this._kbBsStop()}"
+                  @pointercancel="${() => this._kbBsStop()}">⌫</button>
+        </div>
+        <div class="kb-row">
+          ${key(kb.symbols ? "ABC" : "?123", () => { this._kb = { ...this._kb, symbols: !kb.symbols }; }, "kb-wide")}
+          ${key("⌄", () => this._kbHide())}
+          ${ch(",")}
+          ${key("space", () => this._kbType(" "), "kb-space")}
+          ${ch(".")}
+          ${key(isArea ? "↵" : "Done", () => this._kbEnter(), "kb-wide kb-accent")}
+        </div>
+      </div>
+    `;
+  }
+
+  // Hide button: close the keyboard but keep the dialog
+  _kbHide() {
+    const el = this._kbEl;
+    if (el) el.blur();
+    this._kbClose();
+  }
+
   // ---- Rendering: dialog ------------------------------------------------------
 
   _renderDialog() {
     const d = this._dialog;
+    const formMode = !!d && d.mode !== "view";
+    const kbMode = formMode && this._kbEnabled;   // dialog sits at the top so the keyboard fits below it
+    const kbOpen = kbMode && !!this._kb;
     return html`
-      <dialog class="event-dialog"
-              @close="${() => { this._dialog = null; }}"
+      <dialog class="event-dialog ${kbMode ? "kb-mode" : ""} ${kbOpen ? "kb-open" : ""}"
+              @focusin="${(e) => this._onDialogFocusIn(e)}"
+              @close="${() => { this._dialog = null; this._kbClose(); }}"
               @cancel="${(e) => { if (this._dialog && this._dialog.busy) e.preventDefault(); }}"
               @click="${(e) => { if (e.target === e.currentTarget && !(this._dialog && this._dialog.busy)) this._closeDialog(); }}">
         ${d ? html`<div class="dialog-body">${d.mode === "view" ? this._renderView(d) : this._renderForm(d)}</div>` : ""}
+        ${kbOpen ? this._renderKeyboard() : ""}
       </dialog>
     `;
   }
@@ -592,7 +792,8 @@ class InteractiveCalendarCard extends LitElement {
 
       <label class="field">
         <span>Title</span>
-        <input type="text" placeholder="Event title" autofocus
+        <input type="text" placeholder="Event title" autofocus data-kb autocomplete="off"
+               inputmode="${this._kbEnabled ? "none" : "text"}"
                .value="${f.summary}"
                @input="${(e) => this._setField("summary", e.target.value)}"
                @keydown="${(e) => { if (e.key === "Enter") this._save(); }}">
@@ -627,13 +828,15 @@ class InteractiveCalendarCard extends LitElement {
 
       <label class="field">
         <span>Address</span>
-        <input type="text" placeholder="Optional" .value="${f.location}"
+        <input type="text" placeholder="Optional" .value="${f.location}" data-kb autocomplete="off"
+               inputmode="${this._kbEnabled ? "none" : "text"}"
                @input="${(e) => this._setField("location", e.target.value)}">
       </label>
 
       <label class="field">
         <span>Info</span>
-        <textarea rows="3" placeholder="Optional" .value="${f.description}"
+        <textarea rows="3" placeholder="Optional" .value="${f.description}" data-kb
+                  inputmode="${this._kbEnabled ? "none" : "text"}"
                   @input="${(e) => this._setField("description", e.target.value)}"></textarea>
       </label>
 
@@ -888,8 +1091,407 @@ class InteractiveCalendarCard extends LitElement {
       .btn.danger { color: var(--error-color, #ff453a); border-color: transparent; padding-left: 4px; }
       .btn.danger.confirm { background: var(--error-color, #ff453a); color: #fff; padding-left: 12px; }
       .btn:disabled { opacity: 0.6; cursor: default; }
+
+      /* ---- On-screen keyboard ---- */
+      .event-dialog {
+        overflow-y: auto;
+        --kb-key: clamp(34px, 6.8vh, 46px);
+        --kb-h: calc(5 * (var(--kb-key) + 6px) + 18px + env(safe-area-inset-bottom, 0px));
+      }
+      /* Top-aligned whenever the keyboard is enabled, so nothing jumps when it opens */
+      .event-dialog.kb-mode { margin: 12px auto auto; }
+      .event-dialog.kb-open {
+        max-height: calc(100vh - var(--kb-h) - 24px);
+        max-height: calc(100dvh - var(--kb-h) - 24px);
+      }
+      .kb {
+        position: fixed; left: 0; right: 0; bottom: 0; margin: 0 auto; z-index: 1;
+        width: min(100vw, 760px); box-sizing: border-box;
+        padding: 6px 6px calc(8px + env(safe-area-inset-bottom, 0px));
+        display: flex; flex-direction: column; gap: 6px;
+        background: var(--secondary-background-color, #2c2c2e);
+        border-top: 1px solid var(--divider-color, #3a3a3c);
+        border-radius: 14px 14px 0 0;
+        box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.35);
+        user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
+      }
+      .kb-row { display: flex; gap: 5px; justify-content: center; }
+      .kb-inset { padding: 0 4.5%; }
+      .kb-key {
+        flex: 1 1 0; min-width: 0; height: var(--kb-key); padding: 0;
+        font: inherit; font-size: 1.05rem; font-weight: 500; cursor: pointer;
+        color: var(--primary-text-color); background: var(--card-background-color, #1c1c1e);
+        border: 1px solid var(--divider-color, #3a3a3c); border-radius: 8px;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .kb-key:active { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
+      .kb-wide { flex: 1.5 1 0; font-size: 0.85rem; font-weight: 600; }
+      .kb-space { flex: 5 1 0; font-size: 0.85rem; color: var(--secondary-text-color); }
+      .kb-on { background: color-mix(in srgb, var(--primary-color) 35%, var(--card-background-color, #1c1c1e)); border-color: var(--primary-color); }
+      .kb-accent { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
     `;
   }
 }
 
 customElements.define("interactive-calendar-card", InteractiveCalendarCard);
+
+// =============================================================================
+// Visual editor
+// =============================================================================
+const EDITOR_LABELS = {
+  entity: "Calendar",
+  name: "Display name",
+  color: "Color (any CSS color)",
+  style: "Event style",
+  title: "Card title",
+  first_day: "First day of the week",
+  time_format: "Time format",
+  default_start_time: "Default start time",
+  default_duration: "Default event length",
+  auto_sync_minutes: "Auto-sync every (0 = off)",
+  on_screen_keyboard: "On-screen keyboard",
+  show_legend: "Show legend",
+  show_sync_button: "Show sync button",
+  hide_titles: "Hide events with these titles",
+  max_width: "Max card width",
+  day_height: "Day cell min height",
+  header_font_size: "Month title size",
+  event_font_size: "Event text size",
+  day_number_font_size: "Day number size",
+  event_radius: "Event corner radius",
+  card_padding: "Card padding",
+  day_gap: "Gap between days",
+  today_color: "Today highlight color",
+};
+
+const EDITOR_HELPERS = {
+  hide_titles: "Type a title and press Enter. Matching is not case-sensitive.",
+  max_width: "A number means pixels. Units work too, e.g. 8rem or 90%.",
+  day_height: "A number means pixels. Units work too, e.g. 8rem.",
+  on_screen_keyboard: "Shown when you tap a text box in the event popup.",
+};
+
+// Layout values that may be a plain number (pixels) or a CSS size string
+const EDITOR_SIZE_KEYS = [
+  "max_width", "day_height", "header_font_size", "event_font_size",
+  "day_number_font_size", "event_radius", "card_padding", "day_gap",
+];
+
+const EDITOR_SCHEMA = [
+  { name: "title", selector: { text: {} } },
+  {
+    type: "grid", name: "", schema: [
+      { name: "first_day", selector: { select: { mode: "dropdown", options: [
+        { value: "sunday", label: "Sunday" }, { value: "monday", label: "Monday" },
+      ] } } },
+      { name: "time_format", selector: { select: { mode: "dropdown", options: [
+        { value: "12h", label: "12-hour" }, { value: "24h", label: "24-hour" },
+      ] } } },
+    ],
+  },
+  {
+    type: "grid", name: "", schema: [
+      { name: "default_start_time", selector: { time: {} } },
+      { name: "default_duration", selector: { number: { min: 5, max: 1440, mode: "box", unit_of_measurement: "min" } } },
+    ],
+  },
+  { name: "auto_sync_minutes", selector: { number: { min: 0, max: 1440, mode: "box", unit_of_measurement: "min" } } },
+  { name: "on_screen_keyboard", selector: { select: { mode: "dropdown", options: [
+    { value: "always", label: "Always" },
+    { value: "touch", label: "Touchscreens only" },
+    { value: "off", label: "Off" },
+  ] } } },
+  {
+    type: "grid", name: "", schema: [
+      { name: "show_legend", selector: { boolean: {} } },
+      { name: "show_sync_button", selector: { boolean: {} } },
+    ],
+  },
+  { name: "hide_titles", selector: { text: { multiple: true } } },
+  {
+    type: "expandable", name: "", title: "Layout and text", schema: [
+      {
+        type: "grid", name: "", schema: [
+          { name: "max_width", selector: { text: {} } },
+          { name: "day_height", selector: { text: {} } },
+          { name: "header_font_size", selector: { text: {} } },
+          { name: "event_font_size", selector: { text: {} } },
+          { name: "day_number_font_size", selector: { text: {} } },
+          { name: "event_radius", selector: { text: {} } },
+          { name: "card_padding", selector: { text: {} } },
+          { name: "day_gap", selector: { text: {} } },
+        ],
+      },
+      { name: "today_color", selector: { text: {} } },
+    ],
+  },
+];
+
+const CAL_SCHEMA = [
+  { name: "entity", required: true, selector: { entity: { domain: "calendar" } } },
+  {
+    type: "grid", name: "", schema: [
+      { name: "name", selector: { text: {} } },
+      { name: "color", selector: { text: {} } },
+    ],
+  },
+  { name: "style", selector: { select: { mode: "dropdown", options: [
+    { value: "solid", label: "Solid" },
+    { value: "soft", label: "Soft" },
+    { value: "outline", label: "Outline" },
+  ] } } },
+];
+
+// Keys whose value differs between two objects (ha-form returns the whole form
+// every time, but only the keys the user actually changed should be saved)
+const editorDiff = (next, prev) => {
+  const out = {};
+  new Set([...Object.keys(next), ...Object.keys(prev)]).forEach((k) => {
+    if (JSON.stringify(next[k]) !== JSON.stringify(prev[k])) out[k] = next[k];
+  });
+  return out;
+};
+
+const editorIsEmpty = (v) =>
+  v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
+
+class InteractiveCalendarCardEditor extends LitElement {
+  static get properties() {
+    return { hass: {}, _config: {} };
+  }
+
+  setConfig(config) {
+    this._config = config;
+  }
+
+  _fire(config) {
+    this._config = config;
+    this.dispatchEvent(new CustomEvent("config-changed", {
+      detail: { config },
+      bubbles: true,
+      composed: true,
+    }));
+  }
+
+  // ---- Calendars ---------------------------------------------------------------
+
+  // Always work on copies, as objects, whatever shape the YAML used
+  _cals() {
+    const e = this._config.entities;
+    const list = Array.isArray(e) ? e : e ? [e] : [];
+    return list.map((c) => (typeof c === "string" ? { entity: c } : { ...c }));
+  }
+
+  _primaryIdx(cals) {
+    const i = cals.findIndex((c) => c.primary === true);
+    return i === -1 ? 0 : i;
+  }
+
+  _calData(cals, i) {
+    const cal = cals[i];
+    return {
+      entity: cal.entity,
+      name: cal.name,
+      color: cal.color,
+      style: cal.style || (i === this._primaryIdx(cals) ? "solid" : "soft"),
+    };
+  }
+
+  _saveCals(cals) {
+    const entities = cals.map((c) => {
+      const o = { ...c };
+      Object.keys(o).forEach((k) => {
+        if (editorIsEmpty(o[k]) || o[k] === false) delete o[k];
+      });
+      // Keep the YAML tidy: a calendar with only an entity is just the id
+      return Object.keys(o).length === 1 && o.entity ? o.entity : o;
+    });
+    this._fire({ ...this._config, entities });
+  }
+
+  _calChanged(i, e) {
+    e.stopPropagation();
+    const cals = this._cals();
+    const changes = editorDiff(e.detail.value || {}, this._calData(cals, i));
+    for (const [k, v] of Object.entries(changes)) {
+      if (k === "entity" && !v) continue;   // never leave a calendar without an entity
+      if (editorIsEmpty(v)) delete cals[i][k];
+      else cals[i][k] = v;
+    }
+    this._saveCals(cals);
+  }
+
+  _setColor(i, value) {
+    const cals = this._cals();
+    cals[i].color = value;
+    this._saveCals(cals);
+  }
+
+  _makePrimary(i) {
+    const cals = this._cals();
+    cals.forEach((c) => delete c.primary);
+    if (i !== 0) cals[i].primary = true;
+    this._saveCals(cals);
+  }
+
+  _removeCal(i) {
+    const cals = this._cals();
+    if (cals.length < 2) return;
+    const wasPrimary = this._primaryIdx(cals) === i;
+    cals.splice(i, 1);
+    if (wasPrimary) cals.forEach((c) => delete c.primary);
+    this._saveCals(cals);
+  }
+
+  _addCal(e) {
+    e.stopPropagation();
+    const entity = e.detail.value && e.detail.value.entity;
+    if (!entity) return;
+    const cals = this._cals();
+    cals.push({ entity });
+    this._saveCals(cals);
+  }
+
+  // ---- Global options -------------------------------------------------------------
+
+  _globalData() {
+    const c = this._config;
+    const kb = c.on_screen_keyboard;
+    const d = {
+      title: c.title,
+      first_day: c.first_day ?? "sunday",
+      time_format: c.time_format ?? "12h",
+      default_start_time: `${String(c.default_start_time ?? "09:00").padStart(5, "0")}:00`,
+      default_duration: c.default_duration ?? 60,
+      auto_sync_minutes: c.auto_sync_minutes ?? 5,
+      on_screen_keyboard: kb === false || kb === "off" ? "off" : kb === "touch" ? "touch" : "always",
+      show_legend: c.show_legend ?? this._cals().length > 1,
+      show_sync_button: c.show_sync_button !== false,
+      hide_titles: c.hide_titles || [],
+      today_color: c.today_color,
+    };
+    EDITOR_SIZE_KEYS.forEach((k) => {
+      if (c[k] !== undefined && c[k] !== null) d[k] = String(c[k]);
+    });
+    return d;
+  }
+
+  _globalChanged(e) {
+    e.stopPropagation();
+    const changes = editorDiff(e.detail.value || {}, this._globalData());
+    const cfg = { ...this._config };
+    for (const [k, v] of Object.entries(changes)) {
+      let val = v;
+      if (k === "default_start_time" && typeof val === "string") val = val.slice(0, 5);
+      // "105" must be saved as the number 105, or the card would treat it as a CSS string without units
+      if (EDITOR_SIZE_KEYS.includes(k) && typeof val === "string" && /^\d+(\.\d+)?$/.test(val.trim())) {
+        val = Number(val);
+      }
+      if (editorIsEmpty(val)) delete cfg[k];
+      else cfg[k] = val;
+    }
+    this._fire(cfg);
+  }
+
+  // ---- Rendering -------------------------------------------------------------------
+
+  _renderCal(cals, i) {
+    const cal = cals[i];
+    const isPrimary = this._primaryIdx(cals) === i;
+    const swatch = /^#[0-9a-f]{6}$/i.test(cal.color || "")
+      ? cal.color
+      : DEFAULT_PALETTE[i % DEFAULT_PALETTE.length];
+    return html`
+      <div class="cal">
+        <div class="cal-head">
+          <input type="color" title="Pick a color" .value="${swatch}"
+                 @change="${(e) => this._setColor(i, e.target.value)}">
+          <span class="cal-title">Calendar ${i + 1}</span>
+          ${isPrimary
+            ? html`<span class="chip" title="New events are added to this calendar">Primary</span>`
+            : html`<button class="link" @click="${() => this._makePrimary(i)}">Make primary</button>`}
+          <span class="spacer"></span>
+          <button class="icon-btn" title="Remove calendar" ?disabled="${cals.length < 2}"
+                  @click="${() => this._removeCal(i)}">
+            <ha-icon icon="mdi:delete-outline"></ha-icon>
+          </button>
+        </div>
+        <ha-form
+          .hass="${this.hass}"
+          .data="${this._calData(cals, i)}"
+          .schema="${CAL_SCHEMA}"
+          .computeLabel="${(s) => EDITOR_LABELS[s.name] || s.name}"
+          @value-changed="${(e) => this._calChanged(i, e)}"></ha-form>
+      </div>
+    `;
+  }
+
+  render() {
+    if (!this.hass || !this._config) return html``;
+    const cals = this._cals();
+    const used = cals.map((c) => c.entity).filter(Boolean);
+    const addSchema = [{ name: "entity", selector: { entity: { domain: "calendar", exclude_entities: used } } }];
+    return html`
+      <div class="section-title">Calendars</div>
+      ${cals.map((_, i) => this._renderCal(cals, i))}
+      <ha-form
+        .hass="${this.hass}"
+        .data="${{}}"
+        .schema="${addSchema}"
+        .computeLabel="${() => "Add another calendar"}"
+        @value-changed="${(e) => this._addCal(e)}"></ha-form>
+
+      <div class="section-title">Options</div>
+      <ha-form
+        .hass="${this.hass}"
+        .data="${this._globalData()}"
+        .schema="${EDITOR_SCHEMA}"
+        .computeLabel="${(s) => EDITOR_LABELS[s.name] || s.title || s.name}"
+        .computeHelper="${(s) => EDITOR_HELPERS[s.name]}"
+        @value-changed="${(e) => this._globalChanged(e)}"></ha-form>
+    `;
+  }
+
+  static get styles() {
+    return css`
+      :host { display: block; }
+      .section-title { font-weight: 600; margin: 16px 0 8px; color: var(--primary-text-color); }
+      .section-title:first-child { margin-top: 0; }
+      .cal {
+        border: 1px solid var(--divider-color); border-radius: 10px;
+        padding: 10px 12px 6px; margin-bottom: 12px;
+      }
+      .cal-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+      .cal-title { font-weight: 500; color: var(--primary-text-color); }
+      .spacer { flex: 1; }
+      .chip {
+        font-size: 0.75rem; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+        color: var(--text-primary-color, #fff); background: var(--primary-color);
+      }
+      .link {
+        background: none; border: none; padding: 0; cursor: pointer;
+        font: inherit; font-size: 0.85rem; color: var(--primary-color);
+      }
+      .icon-btn {
+        background: none; border: none; cursor: pointer; padding: 4px; border-radius: 50%;
+        color: var(--secondary-text-color); display: inline-flex;
+      }
+      .icon-btn:hover:not(:disabled) { color: var(--error-color, #db4437); }
+      .icon-btn:disabled { opacity: 0.35; cursor: default; }
+      input[type="color"] {
+        width: 30px; height: 26px; padding: 0; cursor: pointer;
+        border: 1px solid var(--divider-color); border-radius: 6px; background: none;
+      }
+    `;
+  }
+}
+
+customElements.define("interactive-calendar-card-editor", InteractiveCalendarCardEditor);
+
+// Lets the card show up in the "Add card" picker
+window.customCards = window.customCards || [];
+window.customCards.push({
+  type: "interactive-calendar-card",
+  name: "Interactive Calendar Card",
+  description: "Month calendar with add, edit and delete, multiple calendars and an on-screen keyboard.",
+});
