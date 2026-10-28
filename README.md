@@ -20,7 +20,8 @@ Everything works with the visual editor and an **on-screen keyboard** for wall-m
 - [Photo screensaver](#photo-screensaver)
 - [On-screen keyboard](#on-screen-keyboard)
 - [Troubleshooting](#troubleshooting)
-
+---
+ ![Calendar view](calendar.png)
 ---
 
 ## Installation
