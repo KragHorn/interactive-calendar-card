@@ -11,6 +11,8 @@ A family-dashboard toolkit for Home Assistant, shipped as a **single JavaScript 
 Everything works with the visual editor and an **on-screen keyboard** for wall-mounted tablets. No helpers, scripts, automations or extra integrations are required.
 
 ---
+   ![Calendar view](images/calendar.png)
+---
 
 ## Contents
 
