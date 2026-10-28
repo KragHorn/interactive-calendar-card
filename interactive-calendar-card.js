@@ -13,6 +13,8 @@ const PLACEHOLDER_DESC = "Created via Home Assistant Dashboard";
 // A number means pixels; strings (e.g. "8rem", "90%") are used as-is
 const cssSize = (v) => (typeof v === "number" ? `${v}px` : String(v));
 // CalendarEntityFeature.UPDATE_EVENT (Google doesn't support it, local calendars do)
+const FEATURE_CREATE = 1;
+const FEATURE_DELETE = 2;
 const FEATURE_UPDATE = 4;
 // Used when a calendar in the config has no color set
 const DEFAULT_PALETTE = ["#0a84ff", "#ff9f0a", "#ff375f", "#30d158", "#bf5af2", "#64d2ff", "#ffd60a"];
@@ -187,6 +189,29 @@ class InteractiveCalendarCard extends LitElement {
     return this._primary.entity;
   }
 
+  // What each calendar allows, from the entity's supported_features
+  // (read-only calendars such as holidays or birthdays support none of these)
+  _features(cal) {
+    return (this.hass && this.hass.states[cal.entity] && this.hass.states[cal.entity].attributes.supported_features) || 0;
+  }
+
+  _canCreate(cal) { return !!(this._features(cal) & FEATURE_CREATE); }
+
+  _canDelete(cal) { return !!(this._features(cal) & FEATURE_DELETE); }
+
+  // Edit works in place, or (Google) as create + delete
+  _canEdit(cal) {
+    const f = this._features(cal);
+    return !!(f & FEATURE_UPDATE) || (!!(f & FEATURE_CREATE) && !!(f & FEATURE_DELETE));
+  }
+
+  // Calendars a new event can go to, primary first
+  get _writableCalendars() {
+    return this._calendars
+      .filter((c) => this._canCreate(c))
+      .sort((a, b) => (b.primary ? 1 : 0) - (a.primary ? 1 : 0));
+  }
+
   get _storageKey() {
     return `interactive-calendar-card-hidden:${this._calendars.map((c) => c.entity).join(",")}`;
   }
@@ -292,6 +317,11 @@ class InteractiveCalendarCard extends LitElement {
 
   handleDayClick(dayNumber, e) {
     if (e.target.closest(".calendar-event-tag")) return;
+    const writable = this._writableCalendars;
+    if (!writable.length) {
+      this._toast("None of these calendars allow adding events");
+      return;
+    }
     const y = this.currentDate.getFullYear();
     const m = this.currentDate.getMonth();
     const [hh, mm] = this._opts.defaultStart.split(":").map(Number);
@@ -300,6 +330,7 @@ class InteractiveCalendarCard extends LitElement {
     this._dialog = {
       mode: "create",
       ev: null,
+      calEntity: writable[0].entity,
       form: {
         summary: "",
         allDay: false,
@@ -437,7 +468,7 @@ class InteractiveCalendarCard extends LitElement {
     const ev = d.ev;
     try {
       if (!ev) {
-        await this.hass.callWS({ type: "calendar/event/create", entity_id: this._entityId, event });
+        await this.hass.callWS({ type: "calendar/event/create", entity_id: d.calEntity, event });
       } else {
         const entity = ev._cal.entity;
         const features = this.hass.states[entity]?.attributes?.supported_features || 0;
@@ -585,7 +616,7 @@ class InteractiveCalendarCard extends LitElement {
       this.updateComplete.then(() => requestAnimationFrame(() => {
         if (el.isConnected) el.scrollIntoView({ block: "nearest" });
       }));
-    } else if (el.matches("input")) {
+    } else if (el.matches("input, select")) {
       this._kbClose();
     }
   }
@@ -768,7 +799,7 @@ class InteractiveCalendarCard extends LitElement {
       ${d.error ? html`<div class="dialog-error">${d.error}</div>` : ""}
 
       <div class="dialog-footer">
-        ${cal.primary ? html`
+        ${this._canDelete(cal) ? html`
           <button class="btn danger ${d.confirmDelete ? "confirm" : ""}"
                   ?disabled="${d.busy}"
                   @click="${() => this._delete()}">
@@ -776,7 +807,7 @@ class InteractiveCalendarCard extends LitElement {
           </button>` : ""}
         <span class="spacer"></span>
         <button class="btn" ?disabled="${d.busy}" @click="${() => this._closeDialog()}">Close</button>
-        ${cal.primary ? html`
+        ${this._canEdit(cal) ? html`
           <button class="btn primary" ?disabled="${d.busy}" @click="${() => this._startEdit()}">Edit</button>` : ""}
       </div>
     `;
@@ -784,11 +815,24 @@ class InteractiveCalendarCard extends LitElement {
 
   _renderForm(d) {
     const f = d.form;
+    const writable = this._writableCalendars;
+    const target = d.mode === "edit"
+      ? d.ev._cal
+      : this._calendars.find((c) => c.entity === d.calEntity) || this._primary;
     return html`
       <div class="dialog-title">
-        <span class="title-bar" style="background:${this._primary.color}"></span>
+        <span class="title-bar" style="background:${target.color}"></span>
         <span class="title-text">${d.mode === "edit" ? "Edit event" : "New event"}</span>
       </div>
+
+      ${d.mode === "create" && writable.length > 1 ? html`
+        <label class="field">
+          <span>Calendar</span>
+          <select @change="${(e) => { this._dialog = { ...this._dialog, calEntity: e.target.value }; }}">
+            ${writable.map((c) => html`
+              <option value="${c.entity}" ?selected="${c.entity === d.calEntity}">${this._calName(c)}</option>`)}
+          </select>
+        </label>` : ""}
 
       <label class="field">
         <span>Title</span>
@@ -1065,14 +1109,14 @@ class InteractiveCalendarCard extends LitElement {
       }
 
       .field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; font-size: 0.8rem; color: var(--secondary-text-color); }
-      .field input, .field textarea {
+      .field input, .field textarea, .field select {
         font: inherit; font-size: 16px; /* 16px stops iOS zooming in on focus */
         color: var(--primary-text-color); background: var(--secondary-background-color);
         border: 1px solid var(--divider-color, #3a3a3c); border-radius: 8px;
         padding: 8px 10px; width: 100%; box-sizing: border-box; color-scheme: light dark;
       }
       .field textarea { resize: vertical; min-height: 64px; }
-      .field input:focus, .field textarea:focus { outline: 2px solid var(--primary-color); outline-offset: -1px; }
+      .field input:focus, .field textarea:focus, .field select:focus { outline: 2px solid var(--primary-color); outline-offset: -1px; }
       .field-row { display: flex; flex-wrap: wrap; gap: 10px; }
       .field-row .field { min-width: 180px; }
       .check { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; cursor: pointer; }
