@@ -164,6 +164,7 @@ class InteractiveCalendarCard extends LitElement {
       "--icc-card-padding": config.card_padding,
       "--icc-gap": config.day_gap,
     };
+    fhApplyPopupVars(this, config);
     this._cardStyle = Object.entries(vars)
       .filter(([, v]) => v !== undefined && v !== null && v !== "")
       .map(([k, v]) => (k === "--icc-today-color" ? `${k}:${v}` : `${k}:${cssSize(v)}`))
@@ -1093,7 +1094,8 @@ class InteractiveCalendarCard extends LitElement {
       .event-dialog {
         border: none; padding: 0; border-radius: 16px;
         width: min(460px, calc(100vw - 32px)); max-height: calc(100vh - 48px);
-        background: var(--ha-card-background, var(--card-background-color, #1c1c1e));
+        background: var(--icc-popup-bg, var(--ha-card-background, var(--card-background-color, #1c1c1e)));
+        -webkit-backdrop-filter: var(--icc-popup-filter, none); backdrop-filter: var(--icc-popup-filter, none);
         color: var(--primary-text-color);
         box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
       }
@@ -1157,7 +1159,8 @@ class InteractiveCalendarCard extends LitElement {
         width: min(100vw, 760px); box-sizing: border-box;
         padding: 6px 6px calc(8px + env(safe-area-inset-bottom, 0px));
         display: flex; flex-direction: column; gap: 6px;
-        background: var(--secondary-background-color, #2c2c2e);
+        background: var(--icc-popup-bg, var(--secondary-background-color, #2c2c2e));
+        -webkit-backdrop-filter: var(--icc-popup-filter, none); backdrop-filter: var(--icc-popup-filter, none);
         border-top: 1px solid var(--divider-color, #3a3a3c);
         border-radius: 14px 14px 0 0;
         box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.35);
@@ -1210,6 +1213,9 @@ const EDITOR_LABELS = {
   card_padding: "Card padding",
   day_gap: "Gap between days",
   today_color: "Today highlight color",
+  popup_opacity: "Popup opacity",
+  popup_color: "Popup color (solid, any CSS color)",
+  popup_blur: "Popup background blur",
 };
 
 const EDITOR_HELPERS = {
@@ -1217,12 +1223,21 @@ const EDITOR_HELPERS = {
   max_width: "A number means pixels. Units work too, e.g. 8rem or 90%.",
   day_height: "A number means pixels. Units work too, e.g. 8rem.",
   on_screen_keyboard: "Shown when you tap a text box in the event popup.",
+  popup_opacity: "100 = fully solid. Lower it to let the dashboard show through.",
+  popup_color: "Optional. Pick a solid color if your theme makes popups see-through.",
+  popup_blur: "Frosted-glass effect behind popups. 0 = off.",
 };
 
 // Layout values that may be a plain number (pixels) or a CSS size string
 const EDITOR_SIZE_KEYS = [
   "max_width", "day_height", "header_font_size", "event_font_size",
   "day_number_font_size", "event_radius", "card_padding", "day_gap",
+];
+
+const POPUP_FIELDS = [
+  { name: "popup_opacity", selector: { number: { min: 0, max: 100, mode: "box", unit_of_measurement: "%" } } },
+  { name: "popup_color", selector: { text: {} } },
+  { name: "popup_blur", selector: { number: { min: 0, max: 50, mode: "box", unit_of_measurement: "px" } } },
 ];
 
 const EDITOR_SCHEMA = [
@@ -1256,6 +1271,7 @@ const EDITOR_SCHEMA = [
     ],
   },
   { name: "hide_titles", selector: { text: { multiple: true } } },
+  { type: "expandable", name: "", title: "Popups (for transparent themes)", schema: POPUP_FIELDS },
   {
     type: "expandable", name: "", title: "Layout and text", schema: [
       {
@@ -1417,6 +1433,9 @@ class InteractiveCalendarCardEditor extends LitElement {
       show_sync_button: c.show_sync_button !== false,
       hide_titles: c.hide_titles || [],
       today_color: c.today_color,
+      popup_opacity: c.popup_opacity,
+      popup_color: c.popup_color,
+      popup_blur: c.popup_blur,
     };
     EDITOR_SIZE_KEYS.forEach((k) => {
       if (c[k] !== undefined && c[k] !== null) d[k] = String(c[k]);
@@ -1587,6 +1606,27 @@ const fhId = () => Math.random().toString(36).slice(2, 8);
 const fhClone = (v) => JSON.parse(JSON.stringify(v));
 const fhKbSupported = () => typeof HTMLElement.prototype.showPopover === "function";
 
+// Popup look, shared by every popup in this file (event dialog, Family Hub sheets,
+// both keyboards). With none of the options set nothing changes.
+//   popup_opacity: 0-100   how solid the popup background is (100 = fully solid)
+//   popup_color:   any CSS color; use a solid one if the theme's popups are see-through
+//   popup_blur:    px of frosted-glass blur behind the popup
+function fhApplyPopupVars(el, cfg) {
+  const op = cfg.popup_opacity;
+  const hasOp = op !== undefined && op !== null && op !== "" && Number.isFinite(Number(op));
+  if (cfg.popup_color || hasOp) {
+    const base = cfg.popup_color
+      || "var(--ha-dialog-surface-background, var(--mdc-theme-surface, var(--card-background-color, #1c1c1e)))";
+    const pct = hasOp ? Math.min(100, Math.max(0, Number(op))) : 100;
+    el.style.setProperty("--icc-popup-bg", pct >= 100 ? base : `color-mix(in srgb, ${base} ${pct}%, transparent)`);
+  } else {
+    el.style.removeProperty("--icc-popup-bg");
+  }
+  const blur = Number(cfg.popup_blur);
+  if (blur > 0) el.style.setProperty("--icc-popup-filter", `blur(${blur}px)`);
+  else el.style.removeProperty("--icc-popup-filter");
+}
+
 async function fhTodoItems(hass, entity) {
   const res = await hass.callWS({ type: "todo/item/list", entity_id: entity });
   return (res && res.items) || [];
@@ -1743,7 +1783,8 @@ class FamilyHubKeyboard extends LitElement {
         inset: auto 0 0 0; margin: 0 auto; width: min(100vw, 760px); height: auto; overflow: visible;
         box-sizing: border-box; border: 0; padding: 6px 6px calc(8px + env(safe-area-inset-bottom, 0px));
         flex-direction: column; gap: 6px;
-        background: var(--secondary-background-color, #2c2c2e); color: var(--primary-text-color, #fff);
+        background: var(--icc-popup-bg, var(--secondary-background-color, #2c2c2e)); color: var(--primary-text-color, #fff);
+        -webkit-backdrop-filter: var(--icc-popup-filter, none); backdrop-filter: var(--icc-popup-filter, none);
         border-radius: 14px 14px 0 0; box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.35);
         user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
         --key: clamp(34px, 6.8vh, 46px);
@@ -2032,6 +2073,7 @@ class FamilyHubCard extends LitElement {
     if (!lists.length && config.shopping_list) lists = [{ entity: config.shopping_list }];
     lists.forEach((l, i) => { l.color = l.color || FH_PALETTE[i % FH_PALETTE.length]; });
     this._cfg = { ...config, tabs: tabs.length ? tabs : ["chores"], lists };
+    fhApplyPopupVars(this, config);
     if (!this._tab || !this._cfg.tabs.includes(this._tab)) {
       this._tab = this._cfg.tabs.includes(config.default_tab) ? config.default_tab : this._cfg.tabs[0];
     }
@@ -2444,6 +2486,7 @@ class FamilyHubCard extends LitElement {
     if (!el || !el.matches || !this._kbOn()) return;
     if (el.matches("[data-kb]")) {
       this._kbOpen = true;
+      fhApplyPopupVars(fhKeyboard(), this._cfg);
       fhKeyboard().show(el);
       this.updateComplete.then(() => requestAnimationFrame(() => {
         if (el.isConnected) el.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -2756,7 +2799,7 @@ class FamilyHubCard extends LitElement {
       .sheet { inset: 0; margin: 0; width: 100%; height: 100%; max-width: none; max-height: none; border: 0; padding: 0; background: rgba(0, 0, 0, 0.55); align-items: center; justify-content: center; }
       .sheet:popover-open { display: flex; }
       .sheet.nopop { position: fixed; z-index: 9999; display: flex; }
-      .panel { box-sizing: border-box; width: min(560px, 94vw); max-height: 90vh; overflow-y: auto; padding: 16px; border-radius: 16px; background: var(--card-background-color); color: var(--primary-text-color); box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column; gap: 10px; }
+      .panel { box-sizing: border-box; width: min(560px, 94vw); max-height: 90vh; overflow-y: auto; padding: 16px; border-radius: 16px; background: var(--icc-popup-bg, var(--card-background-color)); -webkit-backdrop-filter: var(--icc-popup-filter, none); backdrop-filter: var(--icc-popup-filter, none); color: var(--primary-text-color); box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column; gap: 10px; }
       .panel.kb { max-height: calc(100dvh - 330px); align-self: flex-start; margin-top: 12px; }
       .stitle { display: flex; justify-content: space-between; align-items: center; font-size: 1.2rem; font-weight: 600; }
       h4 { margin: 12px 0 0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--secondary-text-color); }
@@ -2795,6 +2838,9 @@ const FH_EDITOR_LABELS = {
   slide_seconds: "Seconds per photo",
   show_clock: "Show clock",
   navigate_path: "When closed, go to (optional)",
+  popup_opacity: "Popup opacity",
+  popup_color: "Popup color (solid, any CSS color)",
+  popup_blur: "Popup background blur",
 };
 const FH_EDITOR_SCHEMA = [
   { name: "store", required: true, selector: { entity: { domain: "todo" } } },
@@ -2811,6 +2857,7 @@ const FH_EDITOR_SCHEMA = [
       ] } } },
     ],
   },
+  { type: "expandable", name: "", title: "Popups (for transparent themes)", schema: POPUP_FIELDS },
   {
     type: "expandable", name: "screensaver", title: "Photo screensaver", schema: [
       { name: "folder", selector: { text: {} } },
@@ -2869,6 +2916,7 @@ class FamilyHubCardEditor extends LitElement {
     return html`
       <ha-form .hass="${this.hass}" .data="${this._data()}" .schema="${FH_EDITOR_SCHEMA}"
                .computeLabel="${(s) => FH_EDITOR_LABELS[s.name] || s.title || s.name}"
+               .computeHelper="${(s) => EDITOR_HELPERS[s.name]}"
                @value-changed="${(e) => this._changed(e)}"></ha-form>
       <p class="note">List names, colors and icons can be set in YAML:
         <code>lists: [{entity: todo.shopping_list, name: Groceries, color: "#30d158", icon: mdi:cart}]</code></p>`;
