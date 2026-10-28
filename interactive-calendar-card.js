@@ -228,6 +228,10 @@ class InteractiveCalendarCard extends LitElement {
 
   updated(changedProperties) {
     this._syncDialogOpen();
+    const kbEl = this.renderRoot.querySelector(".kb[popover]");
+    if (kbEl && typeof kbEl.showPopover === "function" && !kbEl.matches(":popover-open")) {
+      try { kbEl.showPopover(); } catch (e) { /* already open */ }
+    }
     if (!this.hass) return;
     if (this._ssCfg) FamilyScreensaver.configure(this._ssCfg, this.hass);
 
@@ -715,7 +719,7 @@ class InteractiveCalendarCard extends LitElement {
     };
 
     return html`
-      <div class="kb" @mousedown="${(e) => e.preventDefault()}">
+      <div class="kb" popover="manual" @mousedown="${(e) => e.preventDefault()}">
         <div class="kb-row">${KB_NUMBERS.map(ch)}</div>
         <div class="kb-row">${letters[0].map(ch)}</div>
         <div class="kb-row kb-inset">${letters[1].map(ch)}</div>
@@ -1155,7 +1159,8 @@ class InteractiveCalendarCard extends LitElement {
         max-height: calc(100dvh - var(--kb-h) - 24px);
       }
       .kb {
-        position: fixed; left: 0; right: 0; bottom: 0; margin: 0 auto; z-index: 1;
+        position: fixed; top: auto; left: 0; right: 0; bottom: 0; margin: 0 auto; z-index: 1;
+        height: auto; overflow: visible; border: 0;
         width: min(100vw, 760px); box-sizing: border-box;
         padding: 6px 6px calc(8px + env(safe-area-inset-bottom, 0px));
         display: flex; flex-direction: column; gap: 6px;
@@ -1166,6 +1171,7 @@ class InteractiveCalendarCard extends LitElement {
         box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.35);
         user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
       }
+      .kb[popover]:not(:popover-open) { display: none; }
       .kb-row { display: flex; gap: 5px; justify-content: center; }
       .kb-inset { padding: 0 4.5%; }
       .kb-key {
