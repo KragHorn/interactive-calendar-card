@@ -11,7 +11,7 @@ A family-dashboard toolkit for Home Assistant, shipped as a **single JavaScript 
 Everything works with the visual editor and an **on-screen keyboard** for wall-mounted tablets. No helpers, scripts, automations or extra integrations are required.
 
 ---
-   ![Calendar view](calendar.png)
+ ![Calendar view](calendar.png)
 ---
 
 ## Contents
@@ -198,7 +198,7 @@ screensaver:
   slide_seconds: 30
 ```
 
-Or add the stand-alone card to any view:
+Or add the stand-alone card to any view (search "Family photo screensaver" in the card picker and use the visual editor, or use YAML):
 
 ```yaml
 type: custom:family-screensaver-card
