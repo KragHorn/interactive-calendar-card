@@ -2005,6 +2005,14 @@ class FamilyScreensaverCard extends LitElement {
     return { hass: {} };
   }
 
+  static getConfigElement() {
+    return document.createElement("family-screensaver-card-editor");
+  }
+
+  static getStubConfig() {
+    return { folder: "media-source://media_source/local/family_photos", idle_seconds: 120 };
+  }
+
   setConfig(config) {
     this._cfg = config;
   }
@@ -2028,6 +2036,78 @@ class FamilyScreensaverCard extends LitElement {
   }
 }
 customElements.define("family-screensaver-card", FamilyScreensaverCard);
+
+const FS_LABELS = {
+  folder: "Photo folder",
+  urls: "Extra image URLs",
+  idle_seconds: "Start after (seconds, 0 = off)",
+  slide_seconds: "Seconds per photo",
+  fit: "Photo fit",
+  show_clock: "Show clock",
+  navigate_path: "When closed, go to (optional)",
+};
+const FS_HELPERS = {
+  folder: "A media folder, e.g. media-source://media_source/local/family_photos",
+  urls: "Optional. Type a URL and press Enter, e.g. /local/photo.jpg",
+  navigate_path: "A dashboard path such as /lovelace/calendar",
+};
+const FS_DEFAULTS = { idle_seconds: 120, slide_seconds: 30, fit: "cover", show_clock: true };
+const FS_SCHEMA = [
+  { name: "folder", selector: { text: {} } },
+  { name: "urls", selector: { text: { multiple: true } } },
+  {
+    type: "grid", name: "", schema: [
+      { name: "idle_seconds", selector: { number: { min: 0, max: 86400, mode: "box", unit_of_measurement: "s" } } },
+      { name: "slide_seconds", selector: { number: { min: 5, max: 3600, mode: "box", unit_of_measurement: "s" } } },
+    ],
+  },
+  {
+    type: "grid", name: "", schema: [
+      { name: "fit", selector: { select: { mode: "dropdown", options: [
+        { value: "cover", label: "Fill the screen (crop)" }, { value: "contain", label: "Show the whole photo" },
+      ] } } },
+      { name: "show_clock", selector: { boolean: {} } },
+    ],
+  },
+  { name: "navigate_path", selector: { text: {} } },
+];
+
+class FamilyScreensaverCardEditor extends LitElement {
+  static get properties() {
+    return { hass: {}, _config: {} };
+  }
+
+  setConfig(config) {
+    this._config = config;
+  }
+
+  _data() {
+    return { ...FS_DEFAULTS, ...this._config };
+  }
+
+  // Save only what the user actually changed, so the YAML stays short
+  _changed(e) {
+    e.stopPropagation();
+    const changes = editorDiff(e.detail.value || {}, this._data());
+    const cfg = { ...this._config };
+    Object.entries(changes).forEach(([k, v]) => {
+      if (editorIsEmpty(v)) delete cfg[k];
+      else cfg[k] = v;
+    });
+    this._config = cfg;
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: cfg }, bubbles: true, composed: true }));
+  }
+
+  render() {
+    if (!this.hass || !this._config) return html``;
+    return html`
+      <ha-form .hass="${this.hass}" .data="${this._data()}" .schema="${FS_SCHEMA}"
+               .computeLabel="${(s) => FS_LABELS[s.name] || s.name}"
+               .computeHelper="${(s) => FS_HELPERS[s.name]}"
+               @value-changed="${(e) => this._changed(e)}"></ha-form>`;
+  }
+}
+customElements.define("family-screensaver-card-editor", FamilyScreensaverCardEditor);
 
 // -----------------------------------------------------------------------------
 // The Family Hub card
