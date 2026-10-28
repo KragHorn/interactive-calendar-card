@@ -131,6 +131,9 @@ class InteractiveCalendarCard extends LitElement {
       throw new Error('default_start_time must look like "09:00"');
     }
 
+    // Optional photo screensaver (see the Family Hub section at the bottom of this file)
+    this._ssCfg = config.screensaver || null;
+
     // on_screen_keyboard: always (default) | touch (touchscreens only) | off
     const kbRaw = config.on_screen_keyboard;
     const keyboard = kbRaw === false || kbRaw === "off" ? "off" : kbRaw === "touch" ? "touch" : "always";
@@ -225,6 +228,7 @@ class InteractiveCalendarCard extends LitElement {
   updated(changedProperties) {
     this._syncDialogOpen();
     if (!this.hass) return;
+    if (this._ssCfg) FamilyScreensaver.configure(this._ssCfg, this.hass);
 
     if (this._opts.autoSyncMs && Date.now() - this._lastSync > this._opts.autoSyncMs) {
       // Pull fresh data from Google into HA, then redraw
@@ -1539,3 +1543,1353 @@ window.customCards.push({
   name: "Interactive Calendar Card",
   description: "Month calendar with add, edit and delete, multiple calendars and an on-screen keyboard.",
 });
+
+// =============================================================================
+// FAMILY HUB
+//   family-hub-card         chores + stars, meal planner, shared lists
+//   family-screensaver-card optional stand-alone photo screensaver
+//
+// Everything is stored in Home Assistant itself, so every device sees the same
+// data and nothing else has to be installed:
+//   - Lists (groceries, packing...) are ordinary to-do entities.
+//   - People, chores, stars, meal plan and recipes are saved as small JSON
+//     records inside ONE Local To-do list (the `store`). Records are items whose
+//     title starts with "fh:". Don't edit or delete those items by hand.
+// =============================================================================
+
+const FH_PALETTE = ["#0a84ff", "#30d158", "#ff9f0a", "#bf5af2", "#ff375f", "#64d2ff", "#ffd60a"];
+const FH_DAYS = [
+  ["mon", "Mon", "Monday"], ["tue", "Tue", "Tuesday"], ["wed", "Wed", "Wednesday"], ["thu", "Thu", "Thursday"],
+  ["fri", "Fri", "Friday"], ["sat", "Sat", "Saturday"], ["sun", "Sun", "Sunday"],
+];
+const FH_MEALS = [["breakfast", "Breakfast", "🍳"], ["lunch", "Lunch", "🥪"], ["dinner", "Dinner", "🍽️"]];
+const FH_PEOPLE_EMOJI = ["🦊", "🐼", "🦁", "🐯", "🐸", "🦄", "🐙", "🚀", "⭐", "🎮", "⚽", "🎨"];
+const FH_REWARD_EMOJI = ["🍦", "🎬", "🎮", "🎁", "🍕", "🛍️", "🎢", "📱"];
+const FH_DEFAULT_RECIPES = {
+  "Pancakes": ["Pancake mix", "Eggs", "Milk", "Maple syrup"],
+  "Oatmeal": ["Oats", "Milk", "Brown sugar"],
+  "Sandwiches": ["Bread", "Deli meat", "Cheese", "Lettuce"],
+  "Tacos": ["Taco shells", "Ground beef", "Taco seasoning", "Shredded cheese", "Salsa", "Lettuce"],
+  "Spaghetti": ["Spaghetti", "Pasta sauce", "Ground beef", "Parmesan"],
+  "Chicken & rice": ["Chicken", "Rice", "Broccoli"],
+  "Pizza night": ["Pizza dough", "Pizza sauce", "Mozzarella", "Pepperoni"],
+  "Leftovers": [],
+};
+
+const fhPad = (n) => String(n).padStart(2, "0");
+const fhYmd = (d) => `${d.getFullYear()}-${fhPad(d.getMonth() + 1)}-${fhPad(d.getDate())}`;
+const fhMonday = (d) => {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return x;
+};
+const fhId = () => Math.random().toString(36).slice(2, 8);
+const fhClone = (v) => JSON.parse(JSON.stringify(v));
+const fhKbSupported = () => typeof HTMLElement.prototype.showPopover === "function";
+
+async function fhTodoItems(hass, entity) {
+  const res = await hass.callWS({ type: "todo/item/list", entity_id: entity });
+  return (res && res.items) || [];
+}
+
+// -----------------------------------------------------------------------------
+// On-screen keyboard (one shared instance, shown as a top-layer popover so it
+// stays tappable above everything and never blocks the page)
+// -----------------------------------------------------------------------------
+class FamilyHubKeyboard extends LitElement {
+  static get properties() {
+    return { _shift: {}, _sym: {}, _area: {} };
+  }
+
+  constructor() {
+    super();
+    this._shift = "off";
+    this._sym = false;
+    this._area = false;
+    this._el = null;
+    this._lastShift = 0;
+  }
+
+  connectedCallback() {
+    super.connectedCallback();
+    this.setAttribute("popover", "manual");
+    this._noBlur = (e) => e.preventDefault();   // keep focus (and the caret) in the text box
+    this.addEventListener("mousedown", this._noBlur);
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    this.removeEventListener("mousedown", this._noBlur);
+    this._bsStop();
+  }
+
+  get isOpen() {
+    return this.matches(":popover-open");
+  }
+
+  show(el) {
+    this._el = el;
+    this._area = el.tagName === "TEXTAREA";
+    this._shift = this._auto(el);
+    if (!this.isOpen) this.showPopover();
+  }
+
+  hide() {
+    this._bsStop();
+    this._el = null;
+    if (this.isOpen) this.hidePopover();
+    window.dispatchEvent(new CustomEvent("fh-kb-hidden"));
+  }
+
+  _auto(el) {
+    const before = el.value.slice(0, el.selectionStart ?? el.value.length);
+    return before === "" || /[.!?]\s$/.test(before) || /\n$/.test(before) ? "once" : "off";
+  }
+
+  _fire(el) {
+    el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    if (this._shift !== "lock") this._shift = this._auto(el);
+  }
+
+  _type(text) {
+    const el = this._el;
+    if (!el || !el.isConnected) return;
+    const s = el.selectionStart ?? el.value.length;
+    const e = el.selectionEnd ?? s;
+    el.setRangeText(text, s, e, "end");
+    this._fire(el);
+  }
+
+  _backspace() {
+    const el = this._el;
+    if (!el || !el.isConnected) return;
+    let s = el.selectionStart ?? el.value.length;
+    const e = el.selectionEnd ?? s;
+    if (s === e) {
+      if (s === 0) return;
+      const c = el.value.charCodeAt(s - 1);
+      s -= c >= 0xdc00 && c <= 0xdfff && s > 1 ? 2 : 1;
+    }
+    el.setRangeText("", s, e, "end");
+    this._fire(el);
+  }
+
+  _bsDown(e) {
+    e.preventDefault();
+    this._bsStop();
+    this._backspace();
+    this._bsTimer = setTimeout(() => { this._bsInt = setInterval(() => this._backspace(), 55); }, 380);
+  }
+
+  _bsStop() {
+    clearTimeout(this._bsTimer);
+    clearInterval(this._bsInt);
+  }
+
+  _toggleShift() {
+    const now = Date.now();
+    const dbl = now - this._lastShift < 350;
+    this._lastShift = now;
+    this._shift = this._shift === "lock" ? "off" : dbl ? "lock" : this._shift === "off" ? "once" : "off";
+  }
+
+  // Enter: textareas get a new line. Otherwise the text box's own Enter handler
+  // runs (e.g. "add item"); if it doesn't claim the key, the keyboard closes.
+  _enter() {
+    const el = this._el;
+    if (!el) return;
+    if (el.tagName === "TEXTAREA") return this._type("\n");
+    const ev = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, composed: true, cancelable: true });
+    el.dispatchEvent(ev);
+    if (!ev.defaultPrevented) {
+      el.blur();
+      this.hide();
+    }
+  }
+
+  render() {
+    const upper = this._shift !== "off";
+    const rows = this._sym ? KB_SYMBOLS : KB_LETTERS;
+    const key = (label, fn, cls = "") =>
+      html`<button type="button" tabindex="-1" class="k ${cls}" @click="${fn}">${label}</button>`;
+    const ch = (c) => {
+      const out = upper ? c.toUpperCase() : c;
+      return key(out, () => this._type(out));
+    };
+    return html`
+      <div class="r">${KB_NUMBERS.map(ch)}</div>
+      <div class="r">${rows[0].map(ch)}</div>
+      <div class="r inset">${rows[1].map(ch)}</div>
+      <div class="r">
+        ${this._sym ? "" : key(this._shift === "lock" ? "⇪" : "⇧", () => this._toggleShift(), `w ${upper ? "on" : ""}`)}
+        ${rows[2].map(ch)}
+        <button type="button" tabindex="-1" class="k w" aria-label="Backspace"
+                @pointerdown="${(e) => this._bsDown(e)}" @pointerup="${() => this._bsStop()}"
+                @pointerleave="${() => this._bsStop()}" @pointercancel="${() => this._bsStop()}">⌫</button>
+      </div>
+      <div class="r">
+        ${key(this._sym ? "ABC" : "?123", () => { this._sym = !this._sym; }, "w")}
+        ${key("⌄", () => { if (this._el) this._el.blur(); this.hide(); })}
+        ${ch(",")}
+        ${key("space", () => this._type(" "), "space")}
+        ${ch(".")}
+        ${key(this._area ? "↵" : "Done", () => this._enter(), "w accent")}
+      </div>`;
+  }
+
+  static get styles() {
+    return css`
+      :host {
+        inset: auto 0 0 0; margin: 0 auto; width: min(100vw, 760px); height: auto; overflow: visible;
+        box-sizing: border-box; border: 0; padding: 6px 6px calc(8px + env(safe-area-inset-bottom, 0px));
+        flex-direction: column; gap: 6px;
+        background: var(--secondary-background-color, #2c2c2e); color: var(--primary-text-color, #fff);
+        border-radius: 14px 14px 0 0; box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.35);
+        user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation;
+        --key: clamp(34px, 6.8vh, 46px);
+      }
+      :host(:popover-open) { display: flex; }
+      .r { display: flex; gap: 5px; justify-content: center; }
+      .inset { padding: 0 4.5%; }
+      .k {
+        flex: 1 1 0; min-width: 0; height: var(--key); padding: 0; font: inherit; font-size: 1.05rem; font-weight: 500;
+        cursor: pointer; color: var(--primary-text-color); background: var(--card-background-color, #1c1c1e);
+        border: 1px solid var(--divider-color, #3a3a3c); border-radius: 8px; -webkit-tap-highlight-color: transparent;
+      }
+      .k:active { background: var(--primary-color); border-color: var(--primary-color); color: #fff; }
+      .w { flex: 1.5 1 0; font-size: 0.85rem; font-weight: 600; }
+      .space { flex: 5 1 0; font-size: 0.85rem; color: var(--secondary-text-color); }
+      .on { background: color-mix(in srgb, var(--primary-color) 35%, var(--card-background-color, #1c1c1e)); border-color: var(--primary-color); }
+      .accent { background: var(--primary-color); border-color: var(--primary-color); color: #fff; }
+    `;
+  }
+}
+customElements.define("family-hub-keyboard", FamilyHubKeyboard);
+
+const fhKeyboard = () => {
+  let k = document.querySelector("family-hub-keyboard");
+  if (!k) {
+    k = document.createElement("family-hub-keyboard");
+    document.body.appendChild(k);
+  }
+  return k;
+};
+const fhKbHide = () => {
+  if (!fhKbSupported()) return;
+  const k = document.querySelector("family-hub-keyboard");
+  if (k) k.hide();
+};
+
+// -----------------------------------------------------------------------------
+// Photo screensaver (one per page). Starts after `idle_seconds` without a touch,
+// any tap closes it.
+//   screensaver:
+//     folder: media-source://media_source/local/family_photos   # or:
+//     urls: [https://..., /local/photo.jpg]
+//     idle_seconds: 120        # 0 = off
+//     slide_seconds: 30
+//     show_clock: true
+//     fit: cover               # or contain
+//     navigate_path: /lovelace/calendar   # where to go when it closes (optional)
+// -----------------------------------------------------------------------------
+const FamilyScreensaver = {
+  cfg: null,
+  hass: null,
+  _sig: "",
+  _bound: false,
+  _timer: null,
+  _slides: null,
+  _clock: null,
+  _el: null,
+  _armedAt: 0,
+
+  configure(cfg, hass) {
+    this.hass = hass;
+    const sig = JSON.stringify(cfg || {});
+    if (sig === this._sig) return;
+    this._sig = sig;
+    this.cfg = cfg && typeof cfg === "object" ? cfg : null;
+    this._stop(false);
+    if (!this.cfg || this.cfg.idle_seconds === 0) {
+      clearTimeout(this._timer);
+      return;
+    }
+    if (!this._bound) {
+      this._bound = true;
+      ["pointerdown", "pointermove", "keydown", "wheel", "touchstart"].forEach((t) =>
+        window.addEventListener(t, () => this._activity(), { passive: true, capture: true }));
+    }
+    this._arm();
+  },
+
+  _activity() {
+    if (this._el) return;
+    if (Date.now() - this._armedAt < 1000) return;   // pointermove fires constantly
+    this._arm();
+  },
+
+  _arm() {
+    clearTimeout(this._timer);
+    this._armedAt = Date.now();
+    if (!this.cfg) return;
+    const secs = Number(this.cfg.idle_seconds ?? 120);
+    if (!(secs > 0)) return;
+    this._timer = setTimeout(() => this._start(), secs * 1000);
+  },
+
+  async _start() {
+    if (this._el || !this.cfg) return;
+    const el = document.createElement("div");
+    el.style.cssText =
+      "position:fixed;inset:0;z-index:2147483000;background:#000;color:#fff;cursor:none;overflow:hidden;font-family:var(--paper-font-body1_-_font-family,system-ui,sans-serif);";
+    const fit = this.cfg.fit === "contain" ? "contain" : "cover";
+    const layer = () => {
+      const d = document.createElement("div");
+      d.style.cssText = `position:absolute;inset:0;background:center/${fit} no-repeat;opacity:0;transition:opacity 2s ease;`;
+      return d;
+    };
+    const a = layer();
+    const b = layer();
+    el.append(a, b);
+    if (this.cfg.show_clock !== false) {
+      const clock = document.createElement("div");
+      clock.style.cssText =
+        "position:absolute;left:4vw;bottom:5vh;text-shadow:0 2px 12px rgba(0,0,0,.8);pointer-events:none;";
+      el.append(clock);
+      this._clock = clock;
+      this._tick();
+      this._clockTimer = setInterval(() => this._tick(), 15000);
+    }
+    el.addEventListener("click", () => this._stop(true));
+    window.addEventListener("keydown", this._onKey = () => this._stop(true), { once: true });
+    document.body.appendChild(el);
+    this._el = el;
+    this._layers = [a, b];
+    this._front = 0;
+
+    let ids = [];
+    try {
+      ids = await this._collect();
+    } catch (e) {
+      console.warn("Family Hub screensaver: could not read photos", e);
+    }
+    if (!this._el) return;
+    ids.sort(() => Math.random() - 0.5);
+    this._slides = ids;
+    this._idx = -1;
+    this._next();
+    const every = Math.max(5, Number(this.cfg.slide_seconds ?? 30)) * 1000;
+    this._slideTimer = setInterval(() => this._next(), every);
+  },
+
+  _tick() {
+    if (!this._clock) return;
+    const now = new Date();
+    this._clock.innerHTML =
+      `<div style="font-size:9vh;font-weight:300;line-height:1">${now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</div>` +
+      `<div style="font-size:3vh;opacity:.9;margin-top:1vh">${now.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" })}</div>`;
+  },
+
+  async _collect(id = this.cfg.folder, depth = 0) {
+    const out = Array.isArray(this.cfg.urls) ? [...this.cfg.urls] : [];
+    if (!id) return out;
+    const res = await this.hass.callWS({ type: "media_source/browse_media", media_content_id: id });
+    for (const c of res.children || []) {
+      if (c.media_class === "image") out.push(c.media_content_id);
+      else if (c.can_expand && depth < 2) out.push(...(await this._collect(c.media_content_id, depth + 1)));
+    }
+    return out;
+  },
+
+  async _resolve(id) {
+    if (!id.startsWith("media-source://")) return id;
+    const r = await this.hass.callWS({ type: "media_source/resolve_media", media_content_id: id, expires: 4 * 3600 });
+    return this.hass.hassUrl ? this.hass.hassUrl(r.url) : r.url;
+  },
+
+  async _next() {
+    if (!this._el || !this._slides || !this._slides.length) return;
+    for (let tries = 0; tries < 4; tries++) {
+      this._idx = (this._idx + 1) % this._slides.length;
+      try {
+        const url = await this._resolve(this._slides[this._idx]);
+        await new Promise((ok, no) => {
+          const img = new Image();
+          img.onload = ok;
+          img.onerror = no;
+          img.src = url;
+        });
+        if (!this._el) return;
+        const back = this._layers[1 - this._front];
+        const front = this._layers[this._front];
+        back.style.backgroundImage = `url("${url}")`;
+        back.style.opacity = "1";
+        front.style.opacity = "0";
+        this._front = 1 - this._front;
+        return;
+      } catch (e) { /* try the next photo */ }
+    }
+  },
+
+  _stop(rearm) {
+    clearInterval(this._slideTimer);
+    clearInterval(this._clockTimer);
+    if (this._onKey) window.removeEventListener("keydown", this._onKey);
+    this._onKey = null;
+    if (this._el) {
+      this._el.remove();
+      this._el = null;
+      const path = this.cfg && this.cfg.navigate_path;
+      if (path && rearm) {
+        window.history.pushState(null, "", path);
+        window.dispatchEvent(new CustomEvent("location-changed"));
+      }
+    }
+    this._clock = null;
+    if (rearm) this._arm();
+  },
+};
+
+// Stand-alone card: drop it on any view just to switch the screensaver on
+class FamilyScreensaverCard extends LitElement {
+  static get properties() {
+    return { hass: {} };
+  }
+
+  setConfig(config) {
+    this._cfg = config;
+  }
+
+  getCardSize() {
+    return 1;
+  }
+
+  updated() {
+    if (this.hass && this._cfg) FamilyScreensaver.configure(this._cfg, this.hass);
+  }
+
+  render() {
+    if (!this._cfg) return html``;
+    const s = Number(this._cfg.idle_seconds ?? 120);
+    return html`<ha-card><div class="n">📷 Photo screensaver ${s > 0 ? `starts after ${s}s idle` : "is off"}</div></ha-card>`;
+  }
+
+  static get styles() {
+    return css`.n { padding: 10px 14px; font-size: 0.85rem; color: var(--secondary-text-color); }`;
+  }
+}
+customElements.define("family-screensaver-card", FamilyScreensaverCard);
+
+// -----------------------------------------------------------------------------
+// The Family Hub card
+// -----------------------------------------------------------------------------
+class FamilyHubCard extends LitElement {
+  static get properties() {
+    return {
+      hass: {}, _tab: {}, _error: {}, _sheet: {}, _form: {}, _meal: {}, _toastMsg: {},
+      _kbOpen: {}, _listEntity: {}, _listItems: {}, _arm: {},
+    };
+  }
+
+  static getConfigElement() {
+    return document.createElement("family-hub-card-editor");
+  }
+
+  static getStubConfig(hass) {
+    const todos = Object.keys((hass && hass.states) || {}).filter((e) => e.startsWith("todo."));
+    return {
+      store: todos.find((e) => e.includes("family_hub")) || "todo.family_hub_data",
+      shopping_list: todos.find((e) => e.includes("shopping")) || "todo.shopping_list",
+    };
+  }
+
+  constructor() {
+    super();
+    this._tab = null;
+    this._docs = {};          // key -> { uid, data }, not reactive: render via requestUpdate()
+    this._loaded = false;
+    this._error = "";
+    this._sheet = null;
+    this._form = {};
+    this._meal = null;
+    this._toastMsg = "";
+    this._kbOpen = false;
+    this._listEntity = "";
+    this._listItems = {};
+    this._listStates = {};
+    this._arm = "";
+    this._q = Promise.resolve();
+    this._pending = 0;
+    this._optimistic = [];    // taps not saved yet, replayed on top of every refresh
+  }
+
+  setConfig(config) {
+    if (!config.store) {
+      throw new Error("Set `store` to a Local To-do list, e.g. store: todo.family_hub_data");
+    }
+    const tabs = (config.tabs || ["chores", "meals", "lists"]).filter((t) => ["chores", "meals", "lists"].includes(t));
+    let lists = (config.lists || []).map((l) => (typeof l === "string" ? { entity: l } : { ...l }));
+    if (!lists.length && config.shopping_list) lists = [{ entity: config.shopping_list }];
+    lists.forEach((l, i) => { l.color = l.color || FH_PALETTE[i % FH_PALETTE.length]; });
+    this._cfg = { ...config, tabs: tabs.length ? tabs : ["chores"], lists };
+    if (!this._tab || !this._cfg.tabs.includes(this._tab)) {
+      this._tab = this._cfg.tabs.includes(config.default_tab) ? config.default_tab : this._cfg.tabs[0];
+    }
+  }
+
+  getCardSize() {
+    return 8;
+  }
+
+  connectedCallback() {
+    super.connectedCallback();
+    this._onKbHidden = () => { this._kbOpen = false; };
+    window.addEventListener("fh-kb-hidden", this._onKbHidden);
+    this._poller = setInterval(() => this._poll(), 15000);
+    this._onVis = () => { if (!document.hidden) this._poll(); };
+    document.addEventListener("visibilitychange", this._onVis);
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    window.removeEventListener("fh-kb-hidden", this._onKbHidden);
+    document.removeEventListener("visibilitychange", this._onVis);
+    clearInterval(this._poller);
+    fhKbHide();
+  }
+
+  updated(changed) {
+    if (changed.has("hass") && this.hass && this._cfg) {
+      if (this._cfg.screensaver) FamilyScreensaver.configure(this._cfg.screensaver, this.hass);
+      if (!this._started) {
+        this._started = true;
+        this._poll();
+      }
+      // A list's open-item count changed somewhere else: refresh it
+      const l = this._curList;
+      if (l && this._tab === "lists") {
+        const st = this.hass.states[l.entity] && this.hass.states[l.entity].state;
+        if (st !== this._listStates[l.entity]) {
+          this._listStates[l.entity] = st;
+          this._fetchList(l.entity);
+        }
+      }
+    }
+    const pop = this.renderRoot.querySelector(".sheet");
+    if (pop && typeof pop.showPopover === "function" && !pop.matches(":popover-open")) {
+      try { pop.showPopover(); } catch (e) { /* already open */ }
+    }
+  }
+
+  // ---- Storage ----------------------------------------------------------------
+
+  async _fetchDocs() {
+    const items = await fhTodoItems(this.hass, this._cfg.store);
+    const docs = {};
+    for (const it of items) {
+      if (typeof it.summary !== "string" || !it.summary.startsWith("fh:")) continue;
+      const key = it.summary.slice(3);
+      if (docs[key]) continue;
+      let data = null;
+      try { data = it.description ? JSON.parse(it.description) : null; } catch (e) { /* ignore bad JSON */ }
+      docs[key] = { uid: it.uid, data };
+    }
+    return docs;
+  }
+
+  async _poll() {
+    if (this._pending || !this.hass || !this._cfg) return;
+    try {
+      this._docs = await this._fetchDocs();
+      this._error = "";
+      this._loaded = true;
+    } catch (e) {
+      this._error = `Could not read ${this._cfg.store}. Is it a Local To-do list? (${e.message || e.code || e})`;
+    }
+    this.requestUpdate();
+    const l = this._curList;
+    if (l && this._tab === "lists") this._fetchList(l.entity);
+  }
+
+  async _saveDoc(key, data) {
+    const json = JSON.stringify(data);
+    const d = this._docs[key];
+    const target = { entity_id: this._cfg.store };
+    if (d && d.uid) {
+      await this.hass.callService("todo", "update_item", { item: d.uid, description: json }, target);
+    } else {
+      await this.hass.callService("todo", "add_item", { item: `fh:${key}`, description: json }, target);
+      this._docs = await this._fetchDocs();
+    }
+  }
+
+  _peek(key, def) {
+    const d = this._docs[key];
+    return d && d.data != null ? d.data : def;
+  }
+
+  _ctx() {
+    const self = this;
+    const work = {};
+    return {
+      get(key, def) {
+        if (!(key in work)) work[key] = fhClone(self._peek(key, def));
+        return work[key];
+      },
+      commit() {
+        Object.keys(work).forEach((k) => {
+          if (self._docs[k]) self._docs[k].data = work[k];
+          else self._docs[k] = { uid: null, data: work[k] };
+        });
+      },
+      async flush() {
+        for (const k of Object.keys(work)) await self._saveDoc(k, work[k]);
+      },
+    };
+  }
+
+  // Runs `fn` instantly on the local copy (so taps feel immediate), then again on
+  // fresh server data and saves it. Operations run one at a time, and taps that
+  // are still waiting to be saved are replayed on top of each refresh so the
+  // screen never jumps back.
+  async _op(fn) {
+    this._pending++;
+    this._optimistic.push(fn);
+    try {
+      const c = this._ctx();
+      fn(c);
+      c.commit();
+      this.requestUpdate();
+    } catch (e) { /* the real run below reports errors */ }
+    await (this._q = this._q.then(async () => {
+      this._docs = await this._fetchDocs();
+      const c = this._ctx();
+      fn(c);
+      c.commit();
+      this._reapply(fn);
+      await c.flush();
+      this._optimistic = this._optimistic.filter((f) => f !== fn);
+      this._reapply(null);
+    }).catch((e) => {
+      console.error("Family Hub:", e);
+      this._optimistic = this._optimistic.filter((f) => f !== fn);
+      this._notify(`Could not save: ${e.message || e.code || e}`);
+    }));
+    this._pending--;
+    if (!this._pending) await this._poll();
+  }
+
+  _reapply(skip) {
+    const rc = this._ctx();
+    this._optimistic.filter((f) => f !== skip).forEach((f) => {
+      try { f(rc); } catch (e) { /* ignore */ }
+    });
+    rc.commit();
+    this.requestUpdate();
+  }
+
+  _notify(msg) {
+    this._toastMsg = msg;
+    clearTimeout(this._toastT);
+    this._toastT = setTimeout(() => { this._toastMsg = ""; }, 3500);
+  }
+
+  // ---- Chores -----------------------------------------------------------------
+
+  _period(c) {
+    const n = new Date();
+    return c.freq === "weekly" ? `w${fhYmd(fhMonday(n))}` : fhYmd(n);
+  }
+
+  _keyCurrent(k) {
+    const p = String(k).split("@")[1];
+    const n = new Date();
+    return p === fhYmd(n) || p === `w${fhYmd(fhMonday(n))}`;
+  }
+
+  _isDone(c) {
+    const d = this._peek("done", { keys: [] });
+    return d.keys.includes(`${c.id}@${this._period(c)}`);
+  }
+
+  _toggleChore(chore) {
+    return this._op((ctx) => {
+      const done = ctx.get("done", { keys: [] });
+      const stars = ctx.get("stars", {});
+      const key = `${chore.id}@${this._period(chore)}`;
+      const i = done.keys.indexOf(key);
+      const pts = Number(chore.stars) || 0;
+      if (i < 0) {
+        done.keys.push(key);
+        stars[chore.who] = (stars[chore.who] || 0) + pts;
+      } else {
+        done.keys.splice(i, 1);                                    // un-checking takes the stars back,
+        stars[chore.who] = Math.max(0, (stars[chore.who] || 0) - pts); // so it can't be used to farm them
+      }
+      done.keys = done.keys.filter((k) => this._keyCurrent(k));
+    });
+  }
+
+  _confirm(key, fn) {
+    if (this._arm === key) {
+      this._arm = "";
+      fn();
+      return;
+    }
+    this._arm = key;
+    clearTimeout(this._armT);
+    this._armT = setTimeout(() => { this._arm = ""; }, 3000);
+  }
+
+  _redeem(person, reward) {
+    const bal = (this._peek("stars", {})[person.id]) || 0;
+    if (bal < reward.cost) {
+      this._notify(`${person.name} needs ${reward.cost - bal} more ⭐ for ${reward.name}`);
+      return;
+    }
+    this._confirm(`r${person.id}${reward.id}`, () => {
+      this._op((ctx) => {
+        const stars = ctx.get("stars", {});
+        if ((stars[person.id] || 0) < reward.cost) return;
+        stars[person.id] -= reward.cost;
+      });
+      this._notify(`🎉 ${person.name} spent ${reward.cost} ⭐ on ${reward.name}`);
+    });
+  }
+
+  _setup(fn) {
+    return this._op((ctx) => fn(ctx.get("setup", { people: [], chores: [], rewards: [] })));
+  }
+
+  _f(key, val) {
+    this._form = { ...this._form, [key]: val };
+  }
+
+  _addPerson() {
+    const f = this._form;
+    const name = (f.pName || "").trim();
+    if (!name) return this._notify("Type a name first");
+    const idx = this._peek("setup", { people: [] }).people.length;
+    this._setup((s) => s.people.push({
+      id: fhId(), name, emoji: f.pEmoji || FH_PEOPLE_EMOJI[0], color: f.pColor || FH_PALETTE[idx % FH_PALETTE.length],
+    }));
+    this._form = { ...f, pName: "" };
+  }
+
+  _removePerson(id) {
+    this._setup((s) => {
+      s.people = s.people.filter((p) => p.id !== id);
+      s.chores = s.chores.filter((c) => c.who !== id);
+    });
+  }
+
+  _addChore() {
+    const f = this._form;
+    const title = (f.cTitle || "").trim();
+    const people = this._peek("setup", { people: [] }).people;
+    const who = f.cWho || (people[0] && people[0].id);
+    if (!title) return this._notify("Type the chore first");
+    if (!who) return this._notify("Add a person first");
+    const stars = Math.max(0, parseInt(f.cStars, 10) || 1);
+    this._setup((s) => s.chores.push({ id: fhId(), title, who, freq: f.cFreq || "daily", stars }));
+    this._form = { ...f, cTitle: "" };
+  }
+
+  _addReward() {
+    const f = this._form;
+    const name = (f.rName || "").trim();
+    const cost = parseInt(f.rCost, 10);
+    if (!name || !(cost > 0)) return this._notify("Give the reward a name and a star cost");
+    this._setup((s) => s.rewards.push({ id: fhId(), name, cost, icon: f.rIcon || FH_REWARD_EMOJI[0] }));
+    this._form = { ...f, rName: "", rCost: "" };
+  }
+
+  // ---- Meals ------------------------------------------------------------------
+
+  _openMeal(day, meal) {
+    const slot = `${day[0]}.${meal[0]}`;
+    const name = this._peek("plan", {})[slot] || "";
+    const recipes = this._peek("recipes", FH_DEFAULT_RECIPES);
+    this._meal = {
+      slot, label: `${day[2]} ${meal[1].toLowerCase()}`, name,
+      ingredients: (recipes[name] || []).join(", "),
+    };
+    this._sheet = "meal";
+  }
+
+  _pickRecipe(name) {
+    const recipes = this._peek("recipes", FH_DEFAULT_RECIPES);
+    this._meal = { ...this._meal, name, ingredients: (recipes[name] || []).join(", ") };
+  }
+
+  _saveMeal() {
+    const m = this._meal;
+    const name = m.name.trim();
+    const ings = m.ingredients.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+    this._op((ctx) => {
+      const plan = ctx.get("plan", {});
+      if (name) plan[m.slot] = name;
+      else delete plan[m.slot];
+      if (name) ctx.get("recipes", FH_DEFAULT_RECIPES)[name] = ings;
+    });
+    this._closeSheet();
+  }
+
+  _clearWeek() {
+    this._confirm("clearweek", () => this._op((ctx) => {
+      const plan = ctx.get("plan", {});
+      Object.keys(plan).forEach((k) => delete plan[k]);
+    }));
+  }
+
+  async _sendGroceries() {
+    const shop = this._cfg.shopping_list;
+    if (!shop) return this._notify("Set `shopping_list:` in the card settings first");
+    try {
+      const plan = this._peek("plan", {});
+      const recipes = this._peek("recipes", FH_DEFAULT_RECIPES);
+      const need = [];
+      const seen = new Set();
+      Object.values(plan).forEach((meal) => (recipes[meal] || []).forEach((ing) => {
+        const k = ing.toLowerCase();
+        if (!seen.has(k)) { seen.add(k); need.push(ing); }
+      }));
+      const have = new Set();
+      for (const e of [shop, this._cfg.pantry_list].filter(Boolean)) {
+        for (const it of await fhTodoItems(this.hass, e)) {
+          if (e === shop && it.status === "completed") continue;   // already bought
+          have.add(String(it.summary).toLowerCase());
+        }
+      }
+      const add = need.filter((i) => !have.has(i.toLowerCase()));
+      for (const item of add) await this.hass.callService("todo", "add_item", { item }, { entity_id: shop });
+      this._notify(add.length
+        ? `🛒 Added ${add.length} item${add.length > 1 ? "s" : ""} to the shopping list`
+        : "Nothing to add. It's all on the list or in the pantry.");
+    } catch (e) {
+      this._notify(`Could not update the shopping list: ${e.message || e.code || e}`);
+    }
+  }
+
+  // ---- Lists ------------------------------------------------------------------
+
+  get _curList() {
+    const ls = this._cfg ? this._cfg.lists : [];
+    return ls.find((l) => l.entity === this._listEntity) || ls[0];
+  }
+
+  _listName(l) {
+    const st = this.hass && this.hass.states[l.entity];
+    return l.name || (st && st.attributes.friendly_name) || l.entity;
+  }
+
+  async _fetchList(entity) {
+    try {
+      const items = await fhTodoItems(this.hass, entity);
+      this._listItems = { ...this._listItems, [entity]: items };
+    } catch (e) {
+      this._listItems = { ...this._listItems, [entity]: [] };
+    }
+  }
+
+  _selectList(l) {
+    this._listEntity = l.entity;
+    this._fetchList(l.entity);
+  }
+
+  async _toggleItem(l, it) {
+    const status = it.status === "completed" ? "needs_action" : "completed";
+    this._listItems = {
+      ...this._listItems,
+      [l.entity]: (this._listItems[l.entity] || []).map((x) => (x.uid === it.uid ? { ...x, status } : x)),
+    };
+    try {
+      await this.hass.callService("todo", "update_item", { item: it.uid, status }, { entity_id: l.entity });
+    } catch (e) { this._notify(`Could not update: ${e.message || e.code || e}`); }
+    this._fetchList(l.entity);
+  }
+
+  async _removeItems(l, uids) {
+    this._listItems = {
+      ...this._listItems,
+      [l.entity]: (this._listItems[l.entity] || []).filter((x) => !uids.includes(x.uid)),
+    };
+    try {
+      await this.hass.callService("todo", "remove_item", { item: uids }, { entity_id: l.entity });
+    } catch (e) { this._notify(`Could not remove: ${e.message || e.code || e}`); }
+    this._fetchList(l.entity);
+  }
+
+  async _addItem(l) {
+    const text = (this._form.newItem || "").trim();
+    if (!text) return;
+    this._form = { ...this._form, newItem: "" };
+    try {
+      await this.hass.callService("todo", "add_item", { item: text }, { entity_id: l.entity });
+    } catch (e) { this._notify(`Could not add: ${e.message || e.code || e}`); }
+    this._fetchList(l.entity);
+  }
+
+  // ---- Keyboard / sheets -------------------------------------------------------
+
+  _kbOn() {
+    const m = this._cfg.on_screen_keyboard;
+    if (!fhKbSupported() || m === false || m === "off") return false;
+    if (m === "touch") return !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+    return true;
+  }
+
+  _onFocusIn(e) {
+    const el = e.target;
+    if (!el || !el.matches || !this._kbOn()) return;
+    if (el.matches("[data-kb]")) {
+      this._kbOpen = true;
+      fhKeyboard().show(el);
+      this.updateComplete.then(() => requestAnimationFrame(() => {
+        if (el.isConnected) el.scrollIntoView({ block: "center", behavior: "smooth" });
+      }));
+    } else if (el.matches("input, select, textarea")) {
+      fhKbHide();
+    }
+  }
+
+  _onFocusOut() {
+    setTimeout(() => {
+      const a = this.renderRoot.activeElement;
+      if (!a || !a.matches || !a.matches("[data-kb]")) fhKbHide();
+    }, 80);
+  }
+
+  _closeSheet() {
+    this._sheet = null;
+    this._form = {};
+    this._meal = null;
+    this._kbOpen = false;
+    fhKbHide();
+  }
+
+  _in(key, ph, extra = {}) {
+    return html`<input class="in" data-kb type="text" autocomplete="off"
+                       inputmode="${this._kbOn() ? "none" : (extra.mode || "text")}"
+                       placeholder="${ph}" .value="${this._form[key] || ""}"
+                       @input="${(e) => this._f(key, e.target.value)}"
+                       @keydown="${(e) => { if (e.key === "Enter" && extra.enter) { e.preventDefault(); extra.enter(); } }}">`;
+  }
+
+  // ---- Rendering -------------------------------------------------------------------
+
+  render() {
+    if (!this._cfg) return html``;
+    const labels = { chores: "⭐ Chores", meals: "🍽️ Meals", lists: "📝 Lists" };
+    const body = this._error
+      ? html`<div class="empty err">${this._error}<br><br>Create a <b>Local To-do</b> list (for example named
+          “Family Hub Data”) and set it as <code>store:</code>. This card keeps its settings in it.</div>`
+      : !this._loaded
+        ? html`<div class="empty">Loading…</div>`
+        : this._tab === "chores" ? this._renderChores()
+          : this._tab === "meals" ? this._renderMeals() : this._renderLists();
+    return html`
+      <ha-card @focusin="${(e) => this._onFocusIn(e)}" @focusout="${() => this._onFocusOut()}">
+        <div class="top">
+          <div class="tabs">
+            ${this._cfg.tabs.length > 1 ? this._cfg.tabs.map((t) => html`
+              <button class="tab ${t === this._tab ? "on" : ""}" @click="${() => { this._tab = t; if (t === "lists") this._poll(); }}">${labels[t]}</button>`) : ""}
+          </div>
+          ${this._tab === "chores" && this._loaded && !this._error
+            ? html`<button class="gear" title="People, chores and rewards" @click="${() => { this._sheet = "manage"; }}">⚙️</button>` : ""}
+        </div>
+        ${body}
+        ${this._kbOpen ? html`<div style="height:310px"></div>` : ""}
+        ${this._toastMsg ? html`<div class="toast">${this._toastMsg}</div>` : ""}
+        ${this._sheet ? this._renderSheet() : ""}
+      </ha-card>`;
+  }
+
+  _renderChores() {
+    const setup = this._peek("setup", { people: [], chores: [], rewards: [] });
+    if (!setup.people.length) {
+      return html`<div class="empty">No family members yet.<br>Tap ⚙️ to add people, chores and rewards.</div>`;
+    }
+    const stars = this._peek("stars", {});
+    const leader = [...setup.people].sort((a, b) => (stars[b.id] || 0) - (stars[a.id] || 0))[0];
+    return html`
+      ${setup.people.length > 1 && (stars[leader.id] || 0) > 0
+        ? html`<div class="leader">🏆 ${leader.name} is in the lead with ${stars[leader.id]} ⭐</div>` : ""}
+      <div class="people">${setup.people.map((p) => this._renderPerson(p, setup, stars))}</div>`;
+  }
+
+  _renderPerson(p, setup, stars) {
+    const bal = stars[p.id] || 0;
+    const mine = setup.chores.filter((c) => c.who === p.id);
+    const group = (title, freq) => {
+      const list = mine.filter((c) => c.freq === freq);
+      if (!list.length) return "";
+      const done = list.filter((c) => this._isDone(c)).length;
+      return html`
+        <div class="grp">${title}<span>${done}/${list.length}</span></div>
+        ${list.map((c) => {
+          const d = this._isDone(c);
+          return html`<button class="chore ${d ? "done" : ""}" style="--c:${p.color}" @click="${() => this._toggleChore(c)}">
+            <span class="box">${d ? "✓" : ""}</span><span class="t">${c.title}</span><span class="pts">+${c.stars}⭐</span>
+          </button>`;
+        })}`;
+    };
+    return html`
+      <div class="person" style="--c:${p.color}">
+        <div class="phead">
+          <span class="av" style="background:${p.color}">${p.emoji}</span>
+          <span class="pname">${p.name}</span>
+          <span class="bal">${bal} ⭐</span>
+        </div>
+        ${group("Today", "daily")}${group("This week", "weekly")}
+        ${!mine.length ? html`<div class="muted">No chores yet. Tap ⚙️ to add some.</div>` : ""}
+        ${setup.rewards.length ? html`
+          <div class="grp">Rewards</div>
+          <div class="rewards">${setup.rewards.map((r) => {
+            const armed = this._arm === `r${p.id}${r.id}`;
+            return html`<button class="reward ${bal >= r.cost ? "" : "locked"} ${armed ? "arm" : ""}" @click="${() => this._redeem(p, r)}">
+              <span>${r.icon}</span><span>${armed ? "Tap again" : r.name}</span><small>${r.cost} ⭐</small></button>`;
+          })}</div>` : ""}
+      </div>`;
+  }
+
+  _renderMeals() {
+    const plan = this._peek("plan", {});
+    const today = (new Date().getDay() + 6) % 7;
+    return html`
+      <div class="week-scroll"><div class="week">
+        ${FH_DAYS.map((d, i) => html`
+          <div class="day ${i === today ? "today" : ""}">
+            <div class="dname">${d[1]}</div>
+            ${FH_MEALS.map((m) => {
+              const v = plan[`${d[0]}.${m[0]}`];
+              return html`<button class="meal ${v ? "set" : ""}" @click="${() => this._openMeal(d, m)}">
+                <small>${m[2]} ${m[1]}</small><span>${v || "+"}</span></button>`;
+            })}
+          </div>`)}
+      </div></div>
+      <div class="actions">
+        <button class="btn primary" @click="${() => this._sendGroceries()}">🛒 Add ingredients to shopping list</button>
+        <button class="btn ${this._arm === "clearweek" ? "danger" : ""}" @click="${() => this._clearWeek()}">${this._arm === "clearweek" ? "Tap again to clear" : "Clear the week"}</button>
+      </div>`;
+  }
+
+  _renderLists() {
+    const lists = this._cfg.lists;
+    if (!lists.length) {
+      return html`<div class="empty">Add your to-do lists under <code>lists:</code> in the card settings.</div>`;
+    }
+    const l = this._curList;
+    const items = this._listItems[l.entity];
+    const open = (items || []).filter((i) => i.status !== "completed");
+    const done = (items || []).filter((i) => i.status === "completed");
+    const row = (it) => html`
+      <div class="li ${it.status === "completed" ? "done" : ""}">
+        <button class="chk" style="--c:${l.color}" @click="${() => this._toggleItem(l, it)}">${it.status === "completed" ? "✓" : ""}</button>
+        <span class="lt">${it.summary}</span>
+        <button class="x" title="Remove" @click="${() => this._removeItems(l, [it.uid])}">✕</button>
+      </div>`;
+    return html`
+      <div class="chips">${lists.map((x) => {
+        const n = this.hass.states[x.entity] ? this.hass.states[x.entity].state : "";
+        return html`<button class="chip ${x.entity === l.entity ? "on" : ""}" style="--c:${x.color}" @click="${() => this._selectList(x)}">
+          ${x.icon ? html`<ha-icon icon="${x.icon}"></ha-icon>` : ""}${this._listName(x)}${n && n !== "0" && /^\d+$/.test(n) ? html`<b>${n}</b>` : ""}</button>`;
+      })}</div>
+      <div class="listcard" style="--c:${l.color}">
+        <div class="add">
+          <input class="in" data-kb type="text" autocomplete="off" placeholder="Add an item…"
+                 inputmode="${this._kbOn() ? "none" : "text"}" .value="${this._form.newItem || ""}"
+                 @input="${(e) => this._f("newItem", e.target.value)}"
+                 @keydown="${(e) => { if (e.key === "Enter") { e.preventDefault(); this._addItem(l); } }}">
+          <button class="btn primary" @mousedown="${(e) => e.preventDefault()}" @click="${() => this._addItem(l)}">Add</button>
+        </div>
+        ${items === undefined ? html`<div class="muted">Loading…</div>`
+          : !items.length ? html`<div class="muted">Nothing here yet.</div>` : ""}
+        ${open.map(row)}
+        ${done.length ? html`
+          <div class="grp">Done<span><button class="link" @click="${() => this._removeItems(l, done.map((x) => x.uid))}">Clear done</button></span></div>
+          ${done.map(row)}` : ""}
+      </div>`;
+  }
+
+  _renderSheet() {
+    const kb = this._kbOpen ? "kb" : "";
+    const body = this._sheet === "meal" ? this._renderMealSheet() : this._renderManage();
+    return html`
+      <div class="sheet ${fhKbSupported() ? "" : "nopop"}" popover="manual"
+           @click="${(e) => { if (e.target === e.currentTarget) this._closeSheet(); }}">
+        <div class="panel ${kb}">${body}</div>
+      </div>`;
+  }
+
+  _renderMealSheet() {
+    const m = this._meal;
+    const recipes = this._peek("recipes", FH_DEFAULT_RECIPES);
+    const names = Object.keys(recipes).filter((n) => !m.name || n.toLowerCase().includes(m.name.toLowerCase()));
+    return html`
+      <div class="stitle">${m.label}</div>
+      <input class="in" data-kb type="text" autocomplete="off" placeholder="What's for ${m.label.split(" ")[1] || "the meal"}?"
+             inputmode="${this._kbOn() ? "none" : "text"}" .value="${m.name}"
+             @input="${(e) => { this._meal = { ...this._meal, name: e.target.value }; }}">
+      <div class="sugg">${names.slice(0, 12).map((n) => html`
+        <button class="chip" @click="${() => this._pickRecipe(n)}">${n}</button>`)}</div>
+      <label class="lbl">Ingredients (separate with commas). Used for the shopping list.</label>
+      <textarea class="in" data-kb rows="3" inputmode="${this._kbOn() ? "none" : "text"}"
+                .value="${m.ingredients}"
+                @input="${(e) => { this._meal = { ...this._meal, ingredients: e.target.value }; }}"></textarea>
+      <div class="srow">
+        <button class="btn" @click="${() => this._closeSheet()}">Cancel</button>
+        <button class="btn" @click="${() => { this._meal = { ...this._meal, name: "", ingredients: "" }; this._saveMeal(); }}">Clear</button>
+        <button class="btn primary" @click="${() => this._saveMeal()}">Save</button>
+      </div>`;
+  }
+
+  _renderManage() {
+    const s = this._peek("setup", { people: [], chores: [], rewards: [] });
+    const f = this._form;
+    const del = (key, fn) => html`<button class="x ${this._arm === key ? "arm" : ""}" @click="${() => this._confirm(key, fn)}">${this._arm === key ? "Tap again" : "✕"}</button>`;
+    const person = (id) => (s.people.find((p) => p.id === id) || {}).name || "?";
+    return html`
+      <div class="stitle">Family settings <button class="btn primary" @click="${() => this._closeSheet()}">Done</button></div>
+
+      <h4>People</h4>
+      ${s.people.map((p) => html`<div class="mrow"><span class="av" style="background:${p.color}">${p.emoji}</span><span class="grow">${p.name}</span>${del(`p${p.id}`, () => this._removePerson(p.id))}</div>`)}
+      <div class="addbox">
+        ${this._in("pName", "Name")}
+        <div class="picks">${FH_PEOPLE_EMOJI.map((e) => html`<button class="pick ${(f.pEmoji || FH_PEOPLE_EMOJI[0]) === e ? "on" : ""}" @click="${() => this._f("pEmoji", e)}">${e}</button>`)}</div>
+        <div class="picks">${FH_PALETTE.map((c) => html`<button class="sw ${(f.pColor || FH_PALETTE[s.people.length % FH_PALETTE.length]) === c ? "on" : ""}" style="background:${c}" @click="${() => this._f("pColor", c)}"></button>`)}</div>
+        <button class="btn primary" @click="${() => this._addPerson()}">Add person</button>
+      </div>
+
+      <h4>Chores</h4>
+      ${s.chores.map((c) => html`<div class="mrow"><span class="grow">${c.title}<small> · ${person(c.who)} · ${c.freq} · +${c.stars}⭐</small></span>${del(`c${c.id}`, () => this._setup((x) => { x.chores = x.chores.filter((y) => y.id !== c.id); }))}</div>`)}
+      <div class="addbox">
+        ${this._in("cTitle", "New chore, e.g. Make your bed")}
+        <div class="two">
+          <select class="in" @change="${(e) => this._f("cWho", e.target.value)}">
+            ${s.people.map((p) => html`<option value="${p.id}" ?selected="${(f.cWho || (s.people[0] && s.people[0].id)) === p.id}">${p.name}</option>`)}
+          </select>
+          <select class="in" @change="${(e) => this._f("cFreq", e.target.value)}">
+            <option value="daily" ?selected="${(f.cFreq || "daily") === "daily"}">Every day</option>
+            <option value="weekly" ?selected="${f.cFreq === "weekly"}">Every week</option>
+          </select>
+          ${this._in("cStars", "Stars (1)", { mode: "numeric" })}
+        </div>
+        <button class="btn primary" @click="${() => this._addChore()}">Add chore</button>
+      </div>
+
+      <h4>Rewards</h4>
+      ${s.rewards.map((r) => html`<div class="mrow"><span>${r.icon}</span><span class="grow">${r.name}<small> · ${r.cost}⭐</small></span>${del(`w${r.id}`, () => this._setup((x) => { x.rewards = x.rewards.filter((y) => y.id !== r.id); }))}</div>`)}
+      <div class="addbox">
+        <div class="two">${this._in("rName", "Reward, e.g. Movie night")}${this._in("rCost", "Cost in stars", { mode: "numeric" })}</div>
+        <div class="picks">${FH_REWARD_EMOJI.map((e) => html`<button class="pick ${(f.rIcon || FH_REWARD_EMOJI[0]) === e ? "on" : ""}" @click="${() => this._f("rIcon", e)}">${e}</button>`)}</div>
+        <button class="btn primary" @click="${() => this._addReward()}">Add reward</button>
+      </div>`;
+  }
+
+  static get styles() {
+    return css`
+      :host { display: block; }
+      ha-card { padding: 12px; position: relative; color: var(--primary-text-color); }
+      button { font: inherit; color: inherit; cursor: pointer; }
+      .top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+      .tabs { display: flex; gap: 6px; flex: 1; flex-wrap: wrap; }
+      .tab { padding: 8px 14px; border-radius: 999px; border: 1px solid var(--divider-color); background: none; font-weight: 500; }
+      .tab.on { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
+      .gear { background: none; border: none; font-size: 1.4rem; padding: 4px 8px; }
+      .empty { padding: 28px 12px; text-align: center; color: var(--secondary-text-color); line-height: 1.5; }
+      .empty.err { color: var(--error-color, #db4437); }
+      .muted { color: var(--secondary-text-color); font-size: 0.85rem; padding: 6px 2px; }
+      .leader { text-align: center; padding: 8px; margin-bottom: 10px; border-radius: 10px; background: var(--secondary-background-color); font-weight: 500; }
+      .people { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+      .person { border-radius: 14px; padding: 12px; background: var(--secondary-background-color); border-top: 4px solid var(--c); }
+      .phead { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+      .av { width: 38px; height: 38px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 1.3rem; flex: none; }
+      .pname { font-size: 1.15rem; font-weight: 600; flex: 1; }
+      .bal { font-size: 1.15rem; font-weight: 700; color: #ffb300; }
+      .grp { display: flex; justify-content: space-between; align-items: center; margin: 12px 2px 6px; font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--secondary-text-color); }
+      .chore { display: flex; align-items: center; gap: 10px; width: 100%; margin-bottom: 6px; padding: 12px; text-align: left; border: 1px solid var(--divider-color); border-radius: 10px; background: var(--card-background-color); }
+      .chore .box { width: 26px; height: 26px; border-radius: 8px; border: 2px solid var(--c); display: inline-flex; align-items: center; justify-content: center; flex: none; font-weight: 700; color: #fff; }
+      .chore.done .box { background: var(--c); }
+      .chore.done .t { text-decoration: line-through; opacity: 0.55; }
+      .chore .t { flex: 1; }
+      .pts { font-size: 0.8rem; color: var(--secondary-text-color); }
+      .rewards { display: flex; flex-wrap: wrap; gap: 6px; }
+      .reward { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 8px 12px; min-width: 84px; border-radius: 10px; border: 1px solid var(--divider-color); background: var(--card-background-color); }
+      .reward small { color: var(--secondary-text-color); }
+      .reward.locked { opacity: 0.5; }
+      .reward.arm { background: var(--primary-color); color: #fff; border-color: var(--primary-color); opacity: 1; }
+      .week-scroll { overflow-x: auto; }
+      .week { display: grid; grid-template-columns: repeat(7, minmax(112px, 1fr)); gap: 8px; min-width: 800px; }
+      .day { display: flex; flex-direction: column; gap: 6px; }
+      .dname { text-align: center; font-weight: 600; padding: 4px; border-radius: 8px; }
+      .day.today .dname { background: var(--primary-color); color: var(--text-primary-color, #fff); }
+      .meal { display: flex; flex-direction: column; gap: 2px; min-height: 62px; padding: 8px; text-align: left; border: 1px dashed var(--divider-color); border-radius: 10px; background: none; }
+      .meal small { color: var(--secondary-text-color); font-size: 0.7rem; }
+      .meal span { font-weight: 500; }
+      .meal.set { border-style: solid; background: var(--secondary-background-color); }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+      .btn { padding: 10px 16px; border-radius: 10px; border: 1px solid var(--divider-color); background: none; font-weight: 500; }
+      .btn.primary { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
+      .btn.danger { background: var(--error-color, #db4437); border-color: var(--error-color, #db4437); color: #fff; }
+      .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+      .chip { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 999px; border: 2px solid var(--c, var(--divider-color)); background: none; }
+      .chip.on { background: var(--c, var(--primary-color)); color: #fff; }
+      .chip b { font-size: 0.75rem; padding: 1px 7px; border-radius: 999px; background: rgba(0, 0, 0, 0.25); }
+      .listcard { border-radius: 14px; padding: 12px; background: var(--secondary-background-color); border-top: 4px solid var(--c); }
+      .add { display: flex; gap: 8px; margin-bottom: 8px; }
+      .add .in { flex: 1; }
+      .li { display: flex; align-items: center; gap: 10px; padding: 8px 2px; border-bottom: 1px solid var(--divider-color); }
+      .li.done .lt { text-decoration: line-through; opacity: 0.55; }
+      .lt { flex: 1; overflow-wrap: anywhere; }
+      .chk { width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--c); background: none; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; flex: none; padding: 0; }
+      .li.done .chk { background: var(--c); }
+      .x { background: none; border: none; color: var(--secondary-text-color); padding: 6px 8px; border-radius: 8px; }
+      .x.arm { background: var(--error-color, #db4437); color: #fff; }
+      .link { background: none; border: none; color: var(--primary-color); padding: 0; text-transform: none; letter-spacing: 0; }
+      .in { font: inherit; font-size: 16px; width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 10px; color: var(--primary-text-color); background: var(--card-background-color); border: 1px solid var(--divider-color); color-scheme: light dark; }
+      textarea.in { resize: vertical; }
+      .in:focus { outline: 2px solid var(--primary-color); outline-offset: -1px; }
+      .toast { position: sticky; bottom: 8px; margin-top: 10px; padding: 10px 14px; border-radius: 10px; background: var(--primary-text-color); color: var(--card-background-color); text-align: center; }
+
+      /* Pop-up sheets: top layer, so they sit above everything without blocking the keyboard */
+      .sheet { inset: 0; margin: 0; width: 100%; height: 100%; max-width: none; max-height: none; border: 0; padding: 0; background: rgba(0, 0, 0, 0.55); align-items: center; justify-content: center; }
+      .sheet:popover-open { display: flex; }
+      .sheet.nopop { position: fixed; z-index: 9999; display: flex; }
+      .panel { box-sizing: border-box; width: min(560px, 94vw); max-height: 90vh; overflow-y: auto; padding: 16px; border-radius: 16px; background: var(--card-background-color); color: var(--primary-text-color); box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column; gap: 10px; }
+      .panel.kb { max-height: calc(100dvh - 330px); align-self: flex-start; margin-top: 12px; }
+      .stitle { display: flex; justify-content: space-between; align-items: center; font-size: 1.2rem; font-weight: 600; }
+      h4 { margin: 12px 0 0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--secondary-text-color); }
+      .mrow { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--divider-color); }
+      .mrow small { color: var(--secondary-text-color); }
+      .grow { flex: 1; }
+      .addbox { display: flex; flex-direction: column; gap: 8px; padding: 10px; border-radius: 12px; background: var(--secondary-background-color); }
+      .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+      .picks { display: flex; flex-wrap: wrap; gap: 6px; }
+      .pick { width: 40px; height: 40px; font-size: 1.3rem; border-radius: 10px; border: 2px solid transparent; background: var(--card-background-color); padding: 0; }
+      .pick.on { border-color: var(--primary-color); }
+      .sw { width: 32px; height: 32px; border-radius: 50%; border: 3px solid transparent; padding: 0; }
+      .sw.on { border-color: var(--primary-text-color); }
+      .sugg { display: flex; flex-wrap: wrap; gap: 6px; }
+      .sugg .chip { padding: 6px 12px; border-color: var(--divider-color); }
+      .lbl { font-size: 0.8rem; color: var(--secondary-text-color); }
+      .srow { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+    `;
+  }
+}
+customElements.define("family-hub-card", FamilyHubCard);
+
+// -----------------------------------------------------------------------------
+// Visual editor for the Family Hub card
+// -----------------------------------------------------------------------------
+const FH_EDITOR_LABELS = {
+  store: "Data store (Local To-do list)",
+  shopping_list: "Shopping list (meal planner sends ingredients here)",
+  pantry_list: "Pantry list (optional: things you already have)",
+  lists: "Shared lists",
+  default_tab: "Opens on",
+  on_screen_keyboard: "On-screen keyboard",
+  screensaver: "Photo screensaver",
+  idle_seconds: "Start after (seconds, 0 = off)",
+  folder: "Photo folder",
+  slide_seconds: "Seconds per photo",
+  show_clock: "Show clock",
+  navigate_path: "When closed, go to (optional)",
+};
+const FH_EDITOR_SCHEMA = [
+  { name: "store", required: true, selector: { entity: { domain: "todo" } } },
+  { name: "shopping_list", selector: { entity: { domain: "todo" } } },
+  { name: "pantry_list", selector: { entity: { domain: "todo" } } },
+  { name: "lists", selector: { entity: { domain: "todo", multiple: true } } },
+  {
+    type: "grid", name: "", schema: [
+      { name: "default_tab", selector: { select: { mode: "dropdown", options: [
+        { value: "chores", label: "Chores" }, { value: "meals", label: "Meals" }, { value: "lists", label: "Lists" },
+      ] } } },
+      { name: "on_screen_keyboard", selector: { select: { mode: "dropdown", options: [
+        { value: "always", label: "Always" }, { value: "touch", label: "Touchscreens only" }, { value: "off", label: "Off" },
+      ] } } },
+    ],
+  },
+  {
+    type: "expandable", name: "screensaver", title: "Photo screensaver", schema: [
+      { name: "folder", selector: { text: {} } },
+      {
+        type: "grid", name: "", schema: [
+          { name: "idle_seconds", selector: { number: { min: 0, max: 86400, mode: "box" } } },
+          { name: "slide_seconds", selector: { number: { min: 5, max: 3600, mode: "box" } } },
+        ],
+      },
+      { name: "show_clock", selector: { boolean: {} } },
+      { name: "navigate_path", selector: { text: {} } },
+    ],
+  },
+];
+
+class FamilyHubCardEditor extends LitElement {
+  static get properties() {
+    return { hass: {}, _config: {} };
+  }
+
+  setConfig(config) {
+    this._config = config;
+  }
+
+  _data() {
+    const c = this._config;
+    return { ...c, lists: (c.lists || []).map((l) => (typeof l === "string" ? l : l.entity)) };
+  }
+
+  _changed(e) {
+    e.stopPropagation();
+    const v = { ...(e.detail.value || {}) };
+    const old = this._config.lists || [];
+    // Keep per-list name/color/icon that can only be set in YAML
+    if (Array.isArray(v.lists)) {
+      v.lists = v.lists.map((ent) => old.find((o) => typeof o === "object" && o.entity === ent) || ent);
+    }
+    const clean = {};
+    Object.entries(v).forEach(([k, val]) => {
+      if (val === undefined || val === null || val === "" || (Array.isArray(val) && !val.length)) return;
+      if (k === "screensaver" && typeof val === "object") {
+        const ss = {};
+        Object.entries(val).forEach(([sk, sv]) => { if (sv !== undefined && sv !== null && sv !== "") ss[sk] = sv; });
+        if (!Object.keys(ss).length) return;
+        clean[k] = ss;
+        return;
+      }
+      clean[k] = val;
+    });
+    this._config = clean;
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: clean }, bubbles: true, composed: true }));
+  }
+
+  render() {
+    if (!this.hass || !this._config) return html``;
+    return html`
+      <ha-form .hass="${this.hass}" .data="${this._data()}" .schema="${FH_EDITOR_SCHEMA}"
+               .computeLabel="${(s) => FH_EDITOR_LABELS[s.name] || s.title || s.name}"
+               @value-changed="${(e) => this._changed(e)}"></ha-form>
+      <p class="note">List names, colors and icons can be set in YAML:
+        <code>lists: [{entity: todo.shopping_list, name: Groceries, color: "#30d158", icon: mdi:cart}]</code></p>`;
+  }
+
+  static get styles() {
+    return css`.note { font-size: 0.8rem; color: var(--secondary-text-color); margin: 12px 0 0; } code { word-break: break-all; }`;
+  }
+}
+customElements.define("family-hub-card-editor", FamilyHubCardEditor);
+
+window.customCards = window.customCards || [];
+window.customCards.push(
+  {
+    type: "family-hub-card",
+    name: "Family Hub",
+    description: "Chores with star rewards, weekly meal planner with shopping-list push, shared lists, and a photo screensaver.",
+  },
+  {
+    type: "family-screensaver-card",
+    name: "Family photo screensaver",
+    description: "Turns the dashboard into a photo frame after a period of no activity.",
+  },
+);
