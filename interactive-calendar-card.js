@@ -1152,9 +1152,11 @@ class InteractiveCalendarCard extends LitElement {
         --kb-key: clamp(34px, 6.8vh, 46px);
         --kb-h: calc(5 * (var(--kb-key) + 6px) + 18px + env(safe-area-inset-bottom, 0px));
       }
-      /* Top-aligned whenever the keyboard is enabled, so nothing jumps when it opens */
-      .event-dialog.kb-mode { margin: 12px auto auto; }
+      /* Centered on the screen. With the keyboard open it is centered in the space
+         above the keyboard instead, and its height is capped so it never covers it. */
       .event-dialog.kb-open {
+        inset: 0 0 var(--kb-h) 0;
+        margin: auto;
         max-height: calc(100vh - var(--kb-h) - 24px);
         max-height: calc(100dvh - var(--kb-h) - 24px);
       }
@@ -2665,7 +2667,7 @@ class FamilyHubCard extends LitElement {
     const kb = this._kbOpen ? "kb" : "";
     const body = this._sheet === "meal" ? this._renderMealSheet() : this._renderManage();
     return html`
-      <div class="sheet ${fhKbSupported() ? "" : "nopop"}" popover="manual"
+      <div class="sheet ${fhKbSupported() ? "" : "nopop"} ${kb}" popover="manual"
            @click="${(e) => { if (e.target === e.currentTarget) this._closeSheet(); }}">
         <div class="panel ${kb}">${body}</div>
       </div>`;
@@ -2806,7 +2808,10 @@ class FamilyHubCard extends LitElement {
       .sheet:popover-open { display: flex; }
       .sheet.nopop { position: fixed; z-index: 9999; display: flex; }
       .panel { box-sizing: border-box; width: min(560px, 94vw); max-height: 90vh; overflow-y: auto; padding: 16px; border-radius: 16px; background: var(--icc-popup-bg, var(--card-background-color)); -webkit-backdrop-filter: var(--icc-popup-filter, none); backdrop-filter: var(--icc-popup-filter, none); color: var(--primary-text-color); box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column; gap: 10px; }
-      .panel.kb { max-height: calc(100dvh - 330px); align-self: flex-start; margin-top: 12px; }
+      .sheet { --kb-h: calc(5 * (clamp(34px, 6.8vh, 46px) + 6px) + 26px + env(safe-area-inset-bottom, 0px)); }
+      /* With the keyboard open, centre in the space above it and keep clear of it */
+      .sheet.kb { box-sizing: border-box; padding-bottom: var(--kb-h); }
+      .panel.kb { max-height: calc(100vh - var(--kb-h) - 24px); max-height: calc(100dvh - var(--kb-h) - 24px); }
       .stitle { display: flex; justify-content: space-between; align-items: center; font-size: 1.2rem; font-weight: 600; }
       h4 { margin: 12px 0 0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--secondary-text-color); }
       .mrow { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--divider-color); }
